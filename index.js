@@ -20,6 +20,81 @@ const CACHE_TTL = [
     [/^\/api\/burulas\/realtime\//, 15],
     [/^\/api\/burulas\/(prices|stops|schedule)\//, 21600],
 ];
+const TEST_PAGE = String.raw `<!DOCTYPE html>
+<html lang="tr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API testi</title>
+<style>
+body{font-family:Roboto,system-ui,sans-serif;margin:0;padding:16px;background:#fff;color:#111}
+@media (prefers-color-scheme: dark){body{background:#0f172a;color:#f1f5f9}}
+h1{font-size:20px;margin:0 0 4px}
+p{color:#6b7280;font-size:13px;margin:0 0 14px}
+.row{display:flex;gap:10px;align-items:flex-start;padding:12px;border-radius:12px;background:rgba(127,127,127,.12);margin-bottom:8px}
+.ic{font-size:20px;line-height:1.2}
+.nm{font-weight:700;font-size:15px}
+.dt{font-size:12.5px;color:#6b7280;margin-top:2px;word-break:break-word}
+button{width:100%;border:0;border-radius:12px;background:#f97316;color:#fff;font-size:16px;font-weight:700;padding:14px;margin:6px 0 14px}
+</style></head><body>
+<h1>Mutlular Plus API testi</h1>
+<p>Her özellik ayrı ayrı denenir. Bittiğinde bu ekranın görüntüsünü gönder.</p>
+<button id="go" type="button">Yeniden test et</button>
+<div id="out"></div>
+<script>
+var CHECKS=[
+ ['Kesinti özeti','/api/kesintiler/summary'],
+ ['Elektrik kesintileri (UEDAŞ)','/api/kesintiler/uedas'],
+ ['Su kesintileri (BUSKİ)','/api/kesintiler/buski'],
+ ['Nöbetçi eczaneler','/api/nobetci-eczaneler?ilce=osmangazi'],
+ ['Canlı otobüs (15H)','/api/burulas/realtime/15H'],
+ ['Duraklar (15H)','/api/burulas/stops/15H'],
+ ['Sefer saatleri (15H)','/api/burulas/schedule/15H']
+];
+function countItems(j){
+  if(Array.isArray(j)) return j.length;
+  var best=-1;
+  (function walk(o,d){
+    if(d>3||!o||typeof o!=='object') return;
+    Object.keys(o).forEach(function(k){
+      var v=o[k];
+      if(Array.isArray(v)){ if(v.length>best) best=v.length; }
+      else walk(v,d+1);
+    });
+  })(j,0);
+  return best;
+}
+function row(name){
+  var d=document.createElement('div'); d.className='row';
+  d.innerHTML='<div class="ic">⏳</div><div><div class="nm"></div><div class="dt">deneniyor…</div></div>';
+  d.querySelector('.nm').textContent=name;
+  document.getElementById('out').appendChild(d);
+  return d;
+}
+async function run(){
+  var out=document.getElementById('out'); out.innerHTML='';
+  var go=document.getElementById('go'); go.disabled=true;
+  var okCount=0;
+  for(var i=0;i<CHECKS.length;i++){
+    var r=row(CHECKS[i][0]); var t0=Date.now();
+    try{
+      var res=await fetch(CHECKS[i][1]);
+      var txt=await res.text(); var j=null;
+      try{ j=JSON.parse(txt); }catch(e){}
+      var ms=((Date.now()-t0)/1000).toFixed(1)+' sn';
+      if(!j){ r.querySelector('.ic').textContent='❌'; r.querySelector('.dt').textContent='HTTP '+res.status+' · JSON değil: '+txt.slice(0,160); }
+      else if(res.status!==200||j.success===false){ r.querySelector('.ic').textContent='❌'; r.querySelector('.dt').textContent='HTTP '+res.status+' · '+(j.error||j.message||'hata')+' · '+ms; }
+      else{
+        var n=countItems(j);
+        if(n===0){ r.querySelector('.ic').textContent='⚠️'; r.querySelector('.dt').textContent='Yanıt geldi ama kayıt yok (sefer/veri olmayabilir) · '+ms; okCount++; }
+        else{ r.querySelector('.ic').textContent='✅'; r.querySelector('.dt').textContent=(n>0?n+' kayıt · ':'Yanıt geldi · ')+ms; okCount++; }
+      }
+    }catch(e){ r.querySelector('.ic').textContent='❌'; r.querySelector('.dt').textContent='Bağlantı hatası: '+e.message; }
+  }
+  var s=document.createElement('p'); s.style.fontWeight='700'; s.textContent='Sonuç: '+okCount+' / '+CHECKS.length+' çalışıyor'; out.appendChild(s);
+  go.disabled=false;
+}
+document.getElementById('go').addEventListener('click',run);
+run();
+</script></body></html>`;
 const routes = [];
 const app = {
     get: (p, h) => add('GET', p, h),
@@ -1168,11 +1243,14 @@ export default {
         const origin = request.headers.get('Origin');
         const cors = corsHeaders(origin);
         // Tarayıcıdan gelen ama izinli olmayan siteler engellenir
-        if (origin && !ALLOWED_ORIGINS.includes(origin)) {
+        if (origin && !ALLOWED_ORIGINS.includes(origin) && origin !== url.origin) {
             return new Response(JSON.stringify({ success: false, error: 'İzin verilmeyen kaynak.' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
         }
         if (request.method === 'OPTIONS')
             return new Response(null, { status: 204, headers: cors });
+        if (url.pathname === '/test') {
+            return new Response(TEST_PAGE, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+        }
         if (url.pathname === '/' || url.pathname === '/health') {
             return new Response(JSON.stringify({ ok: true, service: 'mutlular-plus-api' }), { headers: { 'Content-Type': 'application/json', ...cors } });
         }
