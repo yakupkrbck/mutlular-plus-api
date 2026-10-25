@@ -62,6 +62,15 @@ function countItems(j){
   })(j,0);
   return best;
 }
+function findSource(j){
+  var found=null;
+  (function walk(o,d){
+    if(found||d>3||!o||typeof o!=='object') return;
+    if(typeof o.source==='string'){ found=o.source; return; }
+    Object.keys(o).forEach(function(k){ if(!found) walk(o[k],d+1); });
+  })(j,0);
+  return found;
+}
 function row(name){
   var d=document.createElement('div'); d.className='row';
   d.innerHTML='<div class="ic">⏳</div><div><div class="nm"></div><div class="dt">deneniyor…</div></div>';
@@ -84,8 +93,12 @@ async function run(){
       else if(res.status!==200||j.success===false){ r.querySelector('.ic').textContent='❌'; r.querySelector('.dt').textContent='HTTP '+res.status+' · '+(j.error||j.message||'hata')+' · '+ms; }
       else{
         var n=countItems(j);
-        if(n===0){ r.querySelector('.ic').textContent='⚠️'; r.querySelector('.dt').textContent='Yanıt geldi ama kayıt yok (sefer/veri olmayabilir) · '+ms; okCount++; }
-        else{ r.querySelector('.ic').textContent='✅'; r.querySelector('.dt').textContent=(n>0?n+' kayıt · ':'Yanıt geldi · ')+ms; okCount++; }
+        var src=findSource(j);
+        var srcTxt=src?(' · kaynak: '+src):'';
+        var isBackup=src&&/LOCAL|FALLBACK|MOCK/i.test(src);
+        if(isBackup){ r.querySelector('.ic').textContent='⚠️'; r.querySelector('.dt').textContent='YEDEK VERİ gösteriliyor (canlı kaynak alınamadı)'+srcTxt+' · '+ms; }
+        else if(n===0){ r.querySelector('.ic').textContent='⚠️'; r.querySelector('.dt').textContent='Yanıt geldi ama kayıt yok (sefer/veri olmayabilir)'+srcTxt+' · '+ms; okCount++; }
+        else{ r.querySelector('.ic').textContent='✅'; r.querySelector('.dt').textContent=(n>0?n+' kayıt':'Yanıt geldi')+srcTxt+' · '+ms; okCount++; }
       }
     }catch(e){ r.querySelector('.ic').textContent='❌'; r.querySelector('.dt').textContent='Bağlantı hatası: '+e.message; }
   }
