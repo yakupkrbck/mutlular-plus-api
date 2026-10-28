@@ -108,6 +108,107 @@ async function run(){
 document.getElementById('go').addEventListener('click',run);
 run();
 </script></body></html>`;
+// ---------------------------------------------------------------------------
+// Cloudinary imzalı yükleme: yalnızca giriş yapmış Firebase kullanıcılarına imza verilir.
+// Gizli değerler Cloudflare'de "Secret" olarak tutulur (repoda yok):
+//   CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET
+// ---------------------------------------------------------------------------
+const FIREBASE_PROJECT_ID = 'mutlular-haber';
+const CLOUDINARY_CLOUD_NAME = 'dn2wanvcr';
+const UPLOAD_FOLDER = 'mutlular';
+const ALLOWED_FORMATS = 'jpg,jpeg,png,webp';
+const JWKS_URL = 'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com';
+let jwksCache = null;
+const signCounters = new Map();
+function b64urlToBytes(b64url) {
+    const b64 = b64url.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((b64url.length + 3) % 4);
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++)
+        out[i] = bin.charCodeAt(i);
+    return out;
+}
+async function getJwks() {
+    const now = Date.now();
+    if (jwksCache && jwksCache.exp > now)
+        return jwksCache.keys;
+    const res = await fetch(JWKS_URL);
+    if (!res.ok)
+        throw new Error('jwks');
+    const json = await res.json();
+    jwksCache = { keys: json.keys || [], exp: now + 60 * 60 * 1000 };
+    return jwksCache.keys;
+}
+// Firebase ID token'ını (RS256) Google'ın açık anahtarlarıyla doğrular.
+async function verifyFirebaseToken(token) {
+    try {
+        const parts = token.split('.');
+        if (parts.length !== 3)
+            return null;
+        const header = JSON.parse(new TextDecoder().decode(b64urlToBytes(parts[0])));
+        const payload = JSON.parse(new TextDecoder().decode(b64urlToBytes(parts[1])));
+        if (header.alg !== 'RS256' || !header.kid)
+            return null;
+        const keys = await getJwks();
+        const jwk = keys.find((k) => k.kid === header.kid);
+        if (!jwk)
+            return null;
+        const key = await crypto.subtle.importKey('jwk', jwk, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+        const ok = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, b64urlToBytes(parts[2]), new TextEncoder().encode(parts[0] + '.' + parts[1]));
+        if (!ok)
+            return null;
+        const nowSec = Math.floor(Date.now() / 1000);
+        if (payload.aud !== FIREBASE_PROJECT_ID)
+            return null;
+        if (payload.iss !== 'https://securetoken.google.com/' + FIREBASE_PROJECT_ID)
+            return null;
+        if (typeof payload.exp !== 'number' || payload.exp < nowSec)
+            return null;
+        if (typeof payload.iat === 'number' && payload.iat > nowSec + 300)
+            return null;
+        if (!payload.sub || typeof payload.sub !== 'string')
+            return null;
+        return { uid: payload.sub };
+    }
+    catch {
+        return null;
+    }
+}
+async function sha1Hex(text) {
+    const buf = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(text));
+    return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+async function handleUploadSignature(request, env, cors) {
+    const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json; charset=utf-8', ...cors } });
+    if (!env || !env.CLOUDINARY_API_SECRET || !env.CLOUDINARY_API_KEY) {
+        return json({ success: false, error: 'upload_not_configured' }, 503);
+    }
+    const auth = request.headers.get('Authorization') || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    const user = token ? await verifyFirebaseToken(token) : null;
+    if (!user)
+        return json({ success: false, error: 'Giriş gerekli.' }, 401);
+    // Basit hız sınırı: kullanıcı başına saatte 60 imza (isolate başına)
+    const now = Date.now();
+    const c = signCounters.get(user.uid);
+    if (!c || c.reset < now)
+        signCounters.set(user.uid, { n: 1, reset: now + 3600_000 });
+    else if (++c.n > 60)
+        return json({ success: false, error: 'Çok fazla yükleme. Biraz sonra deneyin.' }, 429);
+    const timestamp = Math.floor(now / 1000);
+    // Cloudinary imza kuralı: parametreler alfabetik sıralı "k=v&k=v" + api_secret → SHA-1
+    const toSign = `allowed_formats=${ALLOWED_FORMATS}&folder=${UPLOAD_FOLDER}&timestamp=${timestamp}`;
+    const signature = await sha1Hex(toSign + env.CLOUDINARY_API_SECRET);
+    return json({
+        success: true,
+        cloudName: CLOUDINARY_CLOUD_NAME,
+        apiKey: env.CLOUDINARY_API_KEY,
+        timestamp,
+        folder: UPLOAD_FOLDER,
+        allowedFormats: ALLOWED_FORMATS,
+        signature,
+    });
+}
 const routes = [];
 const app = {
     get: (p, h) => add('GET', p, h),
@@ -1245,13 +1346,13 @@ function corsHeaders(origin) {
     if (origin && ALLOWED_ORIGINS.includes(origin)) {
         h['Access-Control-Allow-Origin'] = origin;
         h['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS';
-        h['Access-Control-Allow-Headers'] = 'Content-Type';
+        h['Access-Control-Allow-Headers'] = 'Content-Type, Authorization';
         h['Access-Control-Max-Age'] = '86400';
     }
     return h;
 }
 export default {
-    async fetch(request, _env, ctx) {
+    async fetch(request, env, ctx) {
         const url = new URL(request.url);
         const origin = request.headers.get('Origin');
         const cors = corsHeaders(origin);
@@ -1261,6 +1362,9 @@ export default {
         }
         if (request.method === 'OPTIONS')
             return new Response(null, { status: 204, headers: cors });
+        if (url.pathname === '/api/upload-signature' && request.method === 'POST') {
+            return handleUploadSignature(request, env, cors);
+        }
         if (url.pathname === '/test') {
             return new Response(TEST_PAGE, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
         }
