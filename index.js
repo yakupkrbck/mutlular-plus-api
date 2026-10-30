@@ -16,7 +16,6 @@ const ALLOWED_ORIGINS = [
 // Önbellek süreleri (saniye): kota ve CPU tasarrufu için
 const CACHE_TTL = [
     [/^\/api\/kesintiler\//, 600],
-    [/^\/api\/nobetci-eczaneler/, 600],
     [/^\/api\/burulas\/realtime\//, 15],
     [/^\/api\/burulas\/(prices|stops|schedule)\//, 21600],
 ];
@@ -1018,325 +1017,190 @@ function registerRoutes(app) {
         const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
         return R * c;
     }
-    // Google Haritalar & Karayolu Ağı Canlı Mesafe Doğrulama Fonksiyonu
-    const roadDistanceCache = new Map();
-    async function calculateRealRoadDistance(userLat, userLng, destLat, destLng) {
-        const straightKm = calculateDistanceKmServer(userLat, userLng, destLat, destLng);
-        const cacheKey = `${userLat.toFixed(3)},${userLng.toFixed(3)}_${destLat.toFixed(4)},${destLng.toFixed(4)}`;
-        if (roadDistanceCache.has(cacheKey)) {
-            return roadDistanceCache.get(cacheKey);
-        }
-        try {
-            // Hızlı OSRM gerçek karayolu rota sorgusu
-            const url = `http://router.project-osrm.org/route/v1/driving/${userLng},${userLat};${destLng},${destLat}?overview=false`;
-            const res = await fetch(url, {
-                headers: { 'User-Agent': 'BursaEczane/1.0' },
-                signal: AbortSignal.timeout(1200),
-            });
-            if (res.ok) {
-                const data = await res.json();
-                if (data.routes && data.routes[0]) {
-                    const meters = Math.round(data.routes[0].distance);
-                    const roadKm = Number((meters / 1000).toFixed(1));
-                    const drivingMinutes = Math.max(2, Math.round(data.routes[0].duration / 60));
-                    const walkingMinutes = Math.max(1, Math.round((meters / 1000 / 4.5) * 60));
-                    const result = {
-                        roadKm,
-                        roadMeters: meters,
-                        straightKm: Number(straightKm.toFixed(1)),
-                        drivingMinutes,
-                        walkingMinutes,
-                        isGoogleVerified: true,
-                    };
-                    roadDistanceCache.set(cacheKey, result);
-                    return result;
+    // ----------------------------------------------------------------------
+    // Nöbetçi eczane verisi: eczaneleri.org (Bursa) — HER eczane için nöbet başlangıç/bitiş saati içerir.
+    // "Şu an nöbetçi" bilgisi, bu saatlere ve Türkiye saatine (UTC+3, yaz saati yok) göre hesaplanır.
+    // Uydurma yedek liste YOKTUR: veri alınamazsa açıkça hata döner.
+    // ----------------------------------------------------------------------
+    const ECZANE_SOURCE_URL = 'https://bursa.eczaneleri.org/';
+    const TR_OFFSET_MS = 3 * 60 * 60 * 1000;
+    const htmlToLines = (html) => html
+        .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<\/(h[1-6]|p|li|div|a|span|td|tr|section|article)>/gi, '\n')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&amp;/g, '&')
+        .replace(/&quot;/g, '"')
+        .replace(/&#0?39;|&apos;/g, "'")
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&#(\d+);/g, (_m, n) => String.fromCharCode(Number(n)))
+        .split('\n')
+        .map((l) => l.replace(/\s+/g, ' ').trim())
+        .filter(Boolean);
+    const TS_RE = /^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})\s*\/\s*(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})$/;
+    const PHONE_RE = /^0?\s*\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{2}[\s.-]?\d{2}$/;
+    const trToEpoch = (d, m, y, hh, mm) => Date.UTC(Number(y), Number(m) - 1, Number(d), Number(hh), Number(mm)) - TR_OFFSET_MS;
+    const formatPhone = (raw) => {
+        const digits = raw.replace(/\D/g, '');
+        const d = digits.length === 10 ? '0' + digits : digits;
+        if (d.length === 11)
+            return `${d.slice(0, 4)} ${d.slice(4, 7)} ${d.slice(7, 9)} ${d.slice(9)}`;
+        return raw;
+    };
+    function parseEczaneleriOrg(html) {
+        const lines = htmlToLines(html);
+        const out = [];
+        const seen = new Set();
+        for (let i = 0; i < lines.length; i++) {
+            const m = lines[i].match(TS_RE);
+            if (!m)
+                continue;
+            // Geriye doğru: telefon → adres → "… Eczanesi <İlçe>" başlığı
+            let p = i - 1;
+            while (p >= 0 && i - p <= 4 && !PHONE_RE.test(lines[p]))
+                p--;
+            if (p < 0 || !PHONE_RE.test(lines[p]))
+                continue;
+            const phoneRaw = lines[p];
+            const addrIdx = p - 1;
+            if (addrIdx < 0)
+                continue;
+            const address = lines[addrIdx];
+            let t = addrIdx - 1;
+            while (t >= 0 && addrIdx - t <= 4 && !/Eczanesi/i.test(lines[t]))
+                t--;
+            if (t < 0 || !/Eczanesi/i.test(lines[t]))
+                continue;
+            const title = lines[t];
+            const tm = title.match(/^(.*?Eczanesi)\s*(.*)$/i);
+            if (!tm)
+                continue;
+            const name = tm[1].trim();
+            const district = tm[2].trim() || 'Bursa';
+            const [ilceRaw, bolgeRaw] = district.split('/').map((x) => x.trim());
+            const ilce = ilceRaw || 'Bursa';
+            const bolge = bolgeRaw || undefined;
+            const dutyStart = trToEpoch(m[1], m[2], m[3], m[4], m[5]);
+            const dutyEnd = trToEpoch(m[6], m[7], m[8], m[9], m[10]);
+            const key = `${name}|${ilce}|${bolge || ''}|${dutyStart}`;
+            if (seen.has(key))
+                continue;
+            seen.add(key);
+            // Yalnızca "… Mah." öncesindeki MAHALLE adına bakılır (cadde adı yanlış eşleşmesin: "1. Hürriyet Cad." gibi)
+            const mahMatch = address.match(/^(.*?)\s+(?:mah\.?|mahallesi)(?=\s|$)/i);
+            const neighborhoodSeg = normalizeKesintiText(`${mahMatch ? mahMatch[1] : ''} ${bolge || ''}`);
+            let coords = resolvePharmacyCoords('', ilce);
+            let approxLevel = 'ilce';
+            if (neighborhoodSeg.trim()) {
+                const hits = Object.keys(PHARMACY_NEIGHBORHOOD_COORDS)
+                    .map((k) => ({ k, at: neighborhoodSeg.indexOf(k) }))
+                    .filter((h) => h.at >= 0)
+                    .sort((a, b) => a.at - b.at);
+                if (hits.length > 0) {
+                    coords = PHARMACY_NEIGHBORHOOD_COORDS[hits[0].k];
+                    approxLevel = 'mahalle';
                 }
             }
+            out.push({
+                id: `ecz-${normalizeKesintiText(`${ilce}-${name}`).replace(/[^a-z0-9]+/g, '-')}-${dutyStart}`,
+                name,
+                ilce,
+                bolge,
+                address,
+                phone: formatPhone(phoneRaw),
+                mapsUrl: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${name} ${address} ${ilce} Bursa`)}`,
+                lat: coords.lat,
+                lng: coords.lng,
+                approx: approxLevel,
+                dutyStart,
+                dutyEnd,
+            });
         }
-        catch (_e) {
-            // OSRM zaman aşımında veya hatasında Bursa karayolu kalibrasyonu devreye girer
-        }
-        // Bursa şehir içi gerçek karayolu kalibrasyonu (Mudanya yolu, Bursaray hatları ve viyadükler)
-        const roadKm = Number((straightKm < 0.2
-            ? 0.3
-            : straightKm < 1.0
-                ? straightKm * 2.1
-                : straightKm < 2.5
-                    ? straightKm * 2.65
-                    : straightKm < 5.0
-                        ? straightKm * 1.72
-                        : straightKm * 1.45).toFixed(1));
-        const meters = Math.round(roadKm * 1000);
-        const drivingMinutes = Math.max(2, Math.round((roadKm / 28) * 60));
-        const walkingMinutes = Math.max(1, Math.round((roadKm / 4.5) * 60));
-        const fallbackResult = {
-            roadKm,
-            roadMeters: meters,
-            straightKm: Number(straightKm.toFixed(1)),
-            drivingMinutes,
-            walkingMinutes,
-            isGoogleVerified: true,
-        };
-        roadDistanceCache.set(cacheKey, fallbackResult);
-        return fallbackResult;
+        return out;
     }
-    let serverPharmacyCache = null;
+    let eczaneCache = null;
+    async function loadEczaneList() {
+        const now = Date.now();
+        if (eczaneCache && now - eczaneCache.fetchedAt < 10 * 60 * 1000)
+            return eczaneCache.list;
+        const response = await fetch(ECZANE_SOURCE_URL, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (compatible; MutlularPlusBot/1.0; +https://www.mutlularhaber.com)',
+                Accept: 'text/html,application/xhtml+xml',
+            },
+            signal: AbortSignal.timeout(8000),
+        });
+        if (!response.ok)
+            throw new Error(`Kaynak yanıt vermedi (${response.status})`);
+        const html = await response.text();
+        const list = parseEczaneleriOrg(html);
+        if (list.length === 0)
+            throw new Error('Liste okunamadı (kaynak sayfa biçimi değişmiş olabilir).');
+        eczaneCache = { fetchedAt: now, list };
+        return list;
+    }
     app.get('/api/nobetci-eczaneler', async (req, res) => {
         try {
+            const all = await loadEczaneList();
             const now = Date.now();
-            const CACHE_TTL_MS = 15 * 60 * 1000; // 15 dakika
-            let allPharmacies = [];
-            if (serverPharmacyCache && now - serverPharmacyCache.timestamp < CACHE_TTL_MS) {
-                allPharmacies = serverPharmacyCache.pharmacies;
-            }
-            else {
-                try {
-                    const response = await fetch('https://www.olay.com.tr/bursa-nobetci-eczaneler', {
-                        headers: {
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                            Accept: 'text/html,application/xhtml+xml',
-                        },
-                        signal: AbortSignal.timeout(6000),
-                    });
-                    if (response.ok) {
-                        const html = await response.text();
-                        const parsedList = [];
-                        // 1. Yeni format kontrolü: <div class="eczane" data-ilce="..."
-                        if (html.includes('class="eczane"')) {
-                            const parts = html.split('<div class="eczane"');
-                            for (let i = 1; i < parts.length; i++) {
-                                const chunk = parts[i].split('<div class="eczane"')[0];
-                                const ilceMatch = chunk.match(/data-ilce="([^"]+)"/) || chunk.match(/İLÇE:<\/span>\s*([^<]+)/i);
-                                const nameMatch = chunk.match(/class="eczane-adi[^"]*">.*?([A-Za-zÇĞİÖŞÜçğıöşü\s]+Eczanesi)/i) ||
-                                    chunk.match(/class="eczane-adi[^"]*">([^<]+)/);
-                                const addrMatch = chunk.match(/class="eczane-adres[^"]*">.*?ADRES:<\/span>\s*([^<]+)/i);
-                                const telMatch = chunk.match(/href="tel:([^"]+)"/);
-                                const mapMatch = chunk.match(/href="(https:\/\/maps\.google\.com[^"]+)"/);
-                                if (nameMatch) {
-                                    const rawName = nameMatch[1].replace(/<[^>]+>/g, '').trim();
-                                    let ilce = ilceMatch ? ilceMatch[1].trim() : 'Osmangazi';
-                                    // İlçe adını düzelt (osmangazi -> Osmangazi)
-                                    ilce = ilce.charAt(0).toUpperCase() + ilce.slice(1).toLowerCase();
-                                    const address = addrMatch ? addrMatch[1].trim() : '';
-                                    const phone = telMatch ? telMatch[1].trim() : '';
-                                    const rawMap = mapMatch ? mapMatch[1].replace(/&amp;/g, '&') : '';
-                                    const coords = resolvePharmacyCoords(address, ilce);
-                                    parsedList.push({
-                                        id: `ecz-live-${i}-${rawName.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
-                                        name: rawName,
-                                        ilce,
-                                        address,
-                                        phone,
-                                        mapsUrl: rawMap ||
-                                            `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${rawName} ${address}`)}`,
-                                        lat: coords.lat,
-                                        lng: coords.lng,
-                                        dutyHours: '24 Saat Açık (08:30 - Ertesi gün 08:30)',
-                                    });
-                                }
-                            }
-                        }
-                        else if (html.includes('olay-eczane-card')) {
-                            // 2. Eski format yedek desteği
-                            const parts = html.split('<div class="olay-eczane-card"');
-                            for (let i = 1; i < parts.length; i++) {
-                                const chunk = parts[i].split('<div class="olay-eczane-card"')[0];
-                                const nameMatch = chunk.match(/class="olay-eczane-card-name">([^<]+)<\/h4>/);
-                                const ilceMatch = chunk.match(/class="olay-eczane-card-ilce-val">([^<]+)<\/span>/);
-                                const addrMatch = chunk.match(/class="olay-eczane-card-addr">([^<]+)<\/p>/);
-                                const telMatch = chunk.match(/href="tel:([^"]+)"/);
-                                const mapMatch = chunk.match(/href="(https:\/\/maps\.google\.com[^"]+)"/);
-                                if (nameMatch) {
-                                    const name = nameMatch[1].trim();
-                                    const ilce = ilceMatch ? ilceMatch[1].trim() : 'Osmangazi';
-                                    const address = addrMatch ? addrMatch[1].trim() : '';
-                                    const phone = telMatch ? telMatch[1].trim() : '';
-                                    const rawMap = mapMatch ? mapMatch[1].replace(/&amp;/g, '&') : '';
-                                    const coords = resolvePharmacyCoords(address, ilce);
-                                    parsedList.push({
-                                        id: `ecz-card-${i}-${name.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
-                                        name,
-                                        ilce,
-                                        address,
-                                        phone,
-                                        mapsUrl: rawMap ||
-                                            `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${name} ${address}`)}`,
-                                        lat: coords.lat,
-                                        lng: coords.lng,
-                                        dutyHours: '24 Saat Açık (08:30 - Ertesi gün 08:30)',
-                                    });
-                                }
-                            }
-                        }
-                        if (parsedList.length > 0) {
-                            allPharmacies = parsedList;
-                            serverPharmacyCache = {
-                                timestamp: now,
-                                pharmacies: parsedList,
-                            };
-                        }
-                    }
-                }
-                catch (fetchErr) {
-                    console.warn('Canlı eczane çekme hatası (yedek veri kullanılacak):', fetchErr.message);
-                }
-                // Eğer canlı veri alınamadıysa garantili Bursa Osmangazi / Nilüfer listesini kullan
-                if (allPharmacies.length === 0) {
-                    allPharmacies = [
-                        {
-                            id: 'ecz-1',
-                            name: 'Kardelen Cem Eczanesi',
-                            pharmacist: 'Ecz. Cem Kardelen',
-                            ilce: 'Osmangazi',
-                            neighborhood: 'Küplüpınar',
-                            address: 'Küplüpınar Mahallesi, Dicle Sokak, No:8/A Osmangazi / Bursa',
-                            phone: '02242534173',
-                            mapsUrl: 'https://maps.google.com/?q=Kardelen%20Cem%20Eczanesi%20K%C3%BCpl%C3%BCp%C4%B1nar%20Mahallesi%2C%20Dicle%20Sokak%2C%20No%3A8%2FA%20Osmangazi%20%2F%20Bursa',
-                            lat: 40.206,
-                            lng: 29.055,
-                            dutyHours: '24 Saat Açık',
-                            note: 'Merinos Parkı ve Kent Meydanı civarı',
-                        },
-                        {
-                            id: 'ecz-2',
-                            name: 'Selam Eczanesi',
-                            pharmacist: 'Ecz. Ahmet Selam',
-                            ilce: 'Osmangazi',
-                            neighborhood: 'Dikkaldırım',
-                            address: 'Dikkaldırım Mahallesi, Dikkaldırım Caddesi, No:33 Osmangazi / Bursa',
-                            phone: '02242361004',
-                            mapsUrl: 'https://maps.google.com/?q=Selam%20Eczanesi%20Dikkald%C4%B1r%C4%B1m%20Mahallesi%2C%20Dikkald%C4%B1r%C4%B1m%20Caddesi%2C%20No%3A33%20Osmangazi%20%2F%20Bursa',
-                            lat: 40.2015,
-                            lng: 29.027,
-                            dutyHours: '24 Saat Açık',
-                            note: 'Çekirge Devlet Hastanesi güzergahı',
-                        },
-                        {
-                            id: 'ecz-3',
-                            name: 'Gökçen Eczanesi',
-                            pharmacist: 'Ecz. Nilüfer Gökçen',
-                            ilce: 'Osmangazi',
-                            neighborhood: 'Hamitler',
-                            address: 'Hamitler Mahallesi, 1.Fatih Caddesi, No:23/A Osmangazi / Bursa',
-                            phone: '02249999918',
-                            mapsUrl: 'https://maps.google.com/?q=G%C3%B6k%C3%A7en%20Eczanesi%20Hamitler%20Mahallesi%2C%201.Fatih%20Caddesi%2C%20No%3A23%2FA%20Osmangazi%20%2F%20Bursa',
-                            lat: 40.2452,
-                            lng: 28.9863,
-                            dutyHours: '24 Saat Açık',
-                            note: 'Hamitler TOKİ ve Yunuseli yakını',
-                        },
-                        {
-                            id: 'ecz-4',
-                            name: 'Emin Eczanesi',
-                            pharmacist: 'Ecz. Emin Yıldız',
-                            ilce: 'Osmangazi',
-                            neighborhood: 'Adnan Menderes',
-                            address: 'Adnan Menderes Mahallesi, Oğuzhan Caddesi, No:29 Osmangazi / Bursa',
-                            phone: '02242428680',
-                            mapsUrl: 'https://maps.google.com/?q=Emin%20Eczanesi%20Adnan%20Menderes%20Mahallesi%2C%20O%C4%9Fuzhan%20Caddesi%2C%20No%3A29%20Osmangazi%20%2F%20Bursa',
-                            lat: 40.2468,
-                            lng: 28.995,
-                            dutyHours: '24 Saat Açık',
-                        },
-                        {
-                            id: 'ecz-5',
-                            name: 'Lokman Eczanesi',
-                            pharmacist: 'Ecz. Lokman Şen',
-                            ilce: 'Osmangazi',
-                            neighborhood: 'Doğanbey',
-                            address: 'Doğanbey Mahallesi, Haşim İşcan Caddesi, No:3 Osmangazi / Bursa',
-                            phone: '02242208412',
-                            mapsUrl: 'https://maps.google.com/?q=Lokman%20Eczanesi%20Do%C4%9Fanbey%20Mahallesi%2C%20Ha%C5%9Fim%20I%C5%9Fcan%20Caddesi%2C%20No%3A3%20Osmangazi%20%2F%20Bursa',
-                            lat: 40.1874,
-                            lng: 29.0628,
-                            dutyHours: '24 Saat Açık',
-                            note: 'Fomara Meydanı ve Heykel civarı',
-                        },
-                        {
-                            id: 'ecz-6',
-                            name: 'Altınoluk Eczanesi',
-                            pharmacist: 'Ecz. Merve Altınoluk',
-                            ilce: 'Osmangazi',
-                            neighborhood: 'Başaran',
-                            address: 'Başaran Mahallesi, Başaran Sokak, No:4 Osmangazi / Bursa',
-                            phone: '02242721177',
-                            mapsUrl: 'https://maps.google.com/?q=Alt%C4%B1noluk%20Eczanesi%20Ba%C5%9Faran%20Mahallesi%2C%20Ba%C5%9Faran%20Sokak%2C%20No%3A4%20Osmangazi%20%2F%20Bursa',
-                            lat: 40.2025,
-                            lng: 29.071,
-                            dutyHours: '24 Saat Açık',
-                        },
-                        {
-                            id: 'ecz-7',
-                            name: 'Ümran Eczanesi',
-                            pharmacist: 'Ecz. Ümran Özkan',
-                            ilce: 'Osmangazi',
-                            neighborhood: 'Demirtaş',
-                            address: 'Demirtaş Dumlupınar Mahallesi, Ayazma Caddesi, No:18/B Osmangazi / Bursa',
-                            phone: '05515951261',
-                            mapsUrl: 'https://maps.google.com/?q=%C3%9Cmran%20Eczanesi%20Demirta%C5%9F%20Dumlup%C4%B1nar%20Mahallesi%2C%20Ayazma%20Caddesi%2C%20No%3A18%2FB%20Osmangazi%20%2F%20Bursa',
-                            lat: 40.258,
-                            lng: 29.083,
-                            dutyHours: '24 Saat Açık',
-                        },
-                    ];
-                }
-            }
-            // İlçe Filtreleme (Varsayılan olarak Osmangazi ağırlıklı veya parametreye göre)
-            const ilceParam = req.query.ilce?.toLowerCase();
-            let filtered = allPharmacies;
-            if (ilceParam && ilceParam !== 'all' && ilceParam !== 'tumu') {
-                filtered = allPharmacies.filter((p) => normalizeKesintiText(p.ilce).includes(normalizeKesintiText(ilceParam)));
-                if (filtered.length === 0)
-                    filtered = allPharmacies; // Fallback
-            }
-            // Kullanıcı Koordinatları ve Mesafe Sıralaması
-            const userLat = parseFloat(req.query.lat);
-            const userLng = parseFloat(req.query.lng);
-            let resultList = filtered;
-            if (!isNaN(userLat) && !isNaN(userLng) && userLat > 0 && userLng > 0) {
-                // Her eczane için Google Haritalar & Karayolu Ağı üzerinden gerçek sürüş mesafesini doğrula
-                resultList = await Promise.all(filtered.map(async (p) => {
-                    const roadInfo = await calculateRealRoadDistance(userLat, userLng, p.lat, p.lng);
-                    const distanceFormatted = roadInfo.roadKm < 1 ? `${roadInfo.roadMeters} m` : `${roadInfo.roadKm} km`;
-                    const googleMapsDirectionsUrl = `https://www.google.com/maps/dir/?api=1&origin=${userLat},${userLng}&destination=${encodeURIComponent(`${p.name}, ${p.address}`)}&travelmode=driving`;
-                    return {
-                        ...p,
-                        distanceKm: roadInfo.roadKm,
-                        distanceMeters: roadInfo.roadMeters,
-                        distanceFormatted,
-                        straightDistanceKm: roadInfo.straightKm,
-                        straightDistanceFormatted: `${roadInfo.straightKm} km`,
-                        walkingMinutes: roadInfo.walkingMinutes,
-                        drivingMinutes: roadInfo.drivingMinutes,
-                        isNearest: false,
-                        isGoogleVerified: true,
-                        mapsUrl: googleMapsDirectionsUrl,
-                        googleMapsDirectionsUrl,
-                    };
-                }));
-                // Gerçek karayolu mesafesine göre en yakından en uzağa sırala
-                resultList.sort((a, b) => (a.distanceKm ?? 999) - (b.distanceKm ?? 999));
-                if (resultList.length > 0) {
-                    resultList[0].isNearest = true;
-                }
-            }
+            const WINDOW_MS = 12 * 60 * 60 * 1000;
+            const ilceParam = typeof req.query.ilce === 'string' ? req.query.ilce : '';
+            const filterIlce = (p) => !ilceParam || ilceParam === 'all' || ilceParam === 'tumu'
+                ? true
+                : normalizeKesintiText(p.ilce).includes(normalizeKesintiText(ilceParam));
+            const fmt = (ms) => {
+                const d = new Date(ms + TR_OFFSET_MS);
+                const dd = String(d.getUTCDate()).padStart(2, '0');
+                const mo = String(d.getUTCMonth() + 1).padStart(2, '0');
+                const hh = String(d.getUTCHours()).padStart(2, '0');
+                const mi = String(d.getUTCMinutes()).padStart(2, '0');
+                return `${dd}.${mo} ${hh}:${mi}`;
+            };
+            const pharmacies = all
+                .filter(filterIlce)
+                .map((p) => {
+                const status = p.dutyStart <= now && now < p.dutyEnd
+                    ? 'nobette'
+                    : p.dutyStart > now && p.dutyStart - now <= WINDOW_MS
+                        ? 'yakinda'
+                        : p.dutyEnd <= now
+                            ? 'bitti'
+                            : 'uzak';
+                return {
+                    id: p.id,
+                    name: p.name,
+                    ilce: p.ilce,
+                    bolge: p.bolge,
+                    address: p.address,
+                    phone: p.phone,
+                    mapsUrl: p.mapsUrl,
+                    lat: p.lat,
+                    lng: p.lng,
+                    approx: p.approx,
+                    dutyStart: new Date(p.dutyStart).toISOString(),
+                    dutyEnd: new Date(p.dutyEnd).toISOString(),
+                    dutyLabel: `${fmt(p.dutyStart)} → ${fmt(p.dutyEnd)}`,
+                    status,
+                };
+            })
+                .filter((p) => p.status === 'nobette' || p.status === 'yakinda');
+            const trNow = new Date(now + TR_OFFSET_MS);
             return res.json({
                 success: true,
-                source: serverPharmacyCache ? 'LIVE_BURSA_ECZANE' : 'LOCAL_VERIFIED_DATA',
-                date: new Date().toLocaleDateString('tr-TR', {
-                    day: '2-digit',
-                    month: 'long',
-                    year: 'numeric',
-                }),
-                count: resultList.length,
-                userLocation: !isNaN(userLat) && !isNaN(userLng) ? { lat: userLat, lng: userLng } : undefined,
-                pharmacies: resultList,
-                timestamp: new Date().toISOString(),
+                source: 'LIVE_ECZANELERI_ORG',
+                sourceUrl: ECZANE_SOURCE_URL,
+                date: `${String(trNow.getUTCDate()).padStart(2, '0')}.${String(trNow.getUTCMonth() + 1).padStart(2, '0')}.${trNow.getUTCFullYear()} ${String(trNow.getUTCHours()).padStart(2, '0')}:${String(trNow.getUTCMinutes()).padStart(2, '0')}`,
+                fetchedAt: eczaneCache ? new Date(eczaneCache.fetchedAt).toISOString() : undefined,
+                count: pharmacies.filter((p) => p.status === 'nobette').length,
+                pharmacies,
             });
         }
         catch (err) {
             console.error('Nöbetçi Eczane API Hatası:', err.message);
-            return res.status(500).json({ success: false, error: err.message });
+            return res.status(502).json({ success: false, error: 'Nöbetçi eczane listesi şu an alınamadı. Lütfen resmi listeyi kontrol edin.' });
         }
     });
 }
