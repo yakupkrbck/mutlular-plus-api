@@ -1121,6 +1121,86 @@ function registerRoutes(app) {
         }
         return out;
     }
+    // Bursa ilçeleri: başlıktaki ilçe adını, satır sonu olmayan düz metinde de ayırabilmek için
+    const BURSA_ILCELER = [
+        'Osmangazi', 'Nilüfer', 'Yıldırım', 'Mudanya', 'Gemlik', 'İnegöl', 'Mustafakemalpaşa', 'Orhangazi',
+        'Karacabey', 'Gürsu', 'Kestel', 'Keles', 'Orhaneli', 'Harmancık', 'Büyükorhan', 'İznik', 'Yenişehir',
+    ];
+    const ILCE_ALT = BURSA_ILCELER.map((x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+    function parseEczaneFlat(html) {
+        // Tüm etiketleri boşluğa çevir; zaman damgalarını metin içinde ara (bölünmüş etiketlere dayanıklı)
+        const text = html
+            .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+            .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/&nbsp;/g, ' ')
+            .replace(/&amp;/g, '&')
+            .replace(/&#0?39;|&apos;/g, "'")
+            .replace(/&quot;/g, '"')
+            .replace(/&#(\d+);/g, (_m, n) => String.fromCharCode(Number(n)))
+            .replace(/\s+/g, ' ');
+        const TS_G = /(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})\s*[\/\-–→]*\s*(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})/g;
+        const out = [];
+        const seen = new Set();
+        let prevEnd = 0;
+        let m;
+        while ((m = TS_G.exec(text))) {
+            const segment = text.slice(prevEnd, m.index).trim();
+            prevEnd = m.index + m[0].length;
+            const phoneM = segment.match(/(0?\s*\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{2}[\s.-]?\d{2})\s*$/);
+            if (!phoneM)
+                continue;
+            const phoneRaw = phoneM[1];
+            const beforePhone = segment.slice(0, phoneM.index).trim();
+            // "… Eczanesi <İlçe>[/<Bölge>] <adres…>"
+            const tm = beforePhone.match(new RegExp(`([^\\s][^]*?Eczanesi)\\s+(${ILCE_ALT})(?:\\s*/\\s*([^\\s/]+))?\\s*(.*)$`, 'i'));
+            if (!tm)
+                continue;
+            // Ad: son 1-4 sözcük (önceki bloktan artık kalmasın)
+            const nameWords = tm[1].trim().split(/\s+/);
+            const name = nameWords.slice(-Math.min(nameWords.length, 4)).join(' ');
+            const ilce = BURSA_ILCELER.find((x) => x.toLocaleLowerCase('tr-TR') === tm[2].toLocaleLowerCase('tr-TR')) || tm[2];
+            const bolge = tm[3] || undefined;
+            const address = (tm[4] || '').trim();
+            if (!address)
+                continue;
+            const dutyStart = trToEpoch(m[1], m[2], m[3], m[4], m[5]);
+            const dutyEnd = trToEpoch(m[6], m[7], m[8], m[9], m[10]);
+            const key = `${name}|${ilce}|${bolge || ''}|${dutyStart}`;
+            if (seen.has(key))
+                continue;
+            seen.add(key);
+            const mahMatch = address.match(/^(.*?)\s+(?:mah\.?|mahallesi)(?=\s|$)/i);
+            const neighborhoodSeg = normalizeKesintiText(`${mahMatch ? mahMatch[1] : ''} ${bolge || ''}`);
+            let coords = resolvePharmacyCoords('', ilce);
+            let approxLevel = 'ilce';
+            if (neighborhoodSeg.trim()) {
+                const hits = Object.keys(PHARMACY_NEIGHBORHOOD_COORDS)
+                    .map((k) => ({ k, at: neighborhoodSeg.indexOf(k) }))
+                    .filter((h) => h.at >= 0)
+                    .sort((a, b) => a.at - b.at);
+                if (hits.length > 0) {
+                    coords = PHARMACY_NEIGHBORHOOD_COORDS[hits[0].k];
+                    approxLevel = 'mahalle';
+                }
+            }
+            out.push({
+                id: `ecz-${normalizeKesintiText(`${ilce}-${name}`).replace(/[^a-z0-9]+/g, '-')}-${dutyStart}`,
+                name,
+                ilce,
+                bolge,
+                address,
+                phone: formatPhone(phoneRaw),
+                mapsUrl: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${name} ${address} ${ilce} Bursa`)}`,
+                lat: coords.lat,
+                lng: coords.lng,
+                approx: approxLevel,
+                dutyStart,
+                dutyEnd,
+            });
+        }
+        return out;
+    }
     let eczaneCache = null;
     async function loadEczaneList() {
         const now = Date.now();
@@ -1136,9 +1216,12 @@ function registerRoutes(app) {
         if (!response.ok)
             throw new Error(`Kaynak yanıt vermedi (${response.status})`);
         const html = await response.text();
-        const list = parseEczaneleriOrg(html);
+        let list = parseEczaneleriOrg(html);
         if (list.length === 0)
-            throw new Error('Liste okunamadı (kaynak sayfa biçimi değişmiş olabilir).');
+            list = parseEczaneFlat(html);
+        if (list.length === 0) {
+            throw new Error(`Liste okunamadı (sayfa ${html.length} bayt, biçim beklenenden farklı olabilir)`);
+        }
         eczaneCache = { fetchedAt: now, list };
         return list;
     }
@@ -1200,7 +1283,10 @@ function registerRoutes(app) {
         }
         catch (err) {
             console.error('Nöbetçi Eczane API Hatası:', err.message);
-            return res.status(502).json({ success: false, error: 'Nöbetçi eczane listesi şu an alınamadı. Lütfen resmi listeyi kontrol edin.' });
+            return res.status(502).json({
+                success: false,
+                error: `Nöbetçi eczane listesi şu an alınamadı (${err.message}). Resmi listeyi kontrol edin.`,
+            });
         }
     });
 }
