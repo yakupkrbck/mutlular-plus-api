@@ -1111,6 +1111,8 @@ function registerRoutes(app) {
                 bolge,
                 address,
                 phone: formatPhone(phoneRaw),
+                phones: [formatPhone(phoneRaw)],
+                source: 'eczaneleri',
                 mapsUrl: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${name} ${address} ${ilce} Bursa`)}`,
                 lat: coords.lat,
                 lng: coords.lng,
@@ -1191,6 +1193,8 @@ function registerRoutes(app) {
                 bolge,
                 address,
                 phone: formatPhone(phoneRaw),
+                phones: [formatPhone(phoneRaw)],
+                source: 'eczaneleri',
                 mapsUrl: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${name} ${address} ${ilce} Bursa`)}`,
                 lat: coords.lat,
                 lng: coords.lng,
@@ -1201,33 +1205,213 @@ function registerRoutes(app) {
         }
         return out;
     }
-    let eczaneCache = null;
-    async function loadEczaneList() {
-        const now = Date.now();
-        if (eczaneCache && now - eczaneCache.fetchedAt < 10 * 60 * 1000)
-            return eczaneCache.list;
-        const response = await fetch(ECZANE_SOURCE_URL, {
+    // ----------------------------------------------------------------------
+    // KAYNAK 1 (esas): Bursa Eczacı Odası resmi sayfası — her eczane için TAM GPS konumu ve nöbet saati verir.
+    // KAYNAK 2 (tamamlayıcı): eczaneleri.org — gece yarısından sonra bir önceki akşamın nöbetlerini de içerir.
+    // İki kaynak birleştirilir; biri çalışmazsa diğeri devreye girer. Uydurma yedek liste YOKTUR.
+    // Her kaynağa 10 dakikada en fazla 1 istek atılır (önbellek) ve istek kendini dürüstçe tanıtır.
+    // ----------------------------------------------------------------------
+    const BEO_URL = 'https://www.beo.org.tr/nobetci-eczaneler';
+    const OUR_UA = 'Mozilla/5.0 (compatible; MutlularPlusBot/1.0; +https://www.mutlularhaber.com)';
+    const SOURCE_TTL_MS = 10 * 60 * 1000;
+    const titleCaseTr = (t) => t
+        .trim()
+        .toLocaleLowerCase('tr-TR')
+        .split(/\s+/)
+        .map((w) => w.charAt(0).toLocaleUpperCase('tr-TR') + w.slice(1))
+        .join(' ');
+    const stripTags = (t) => t
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&amp;/g, '&')
+        .replace(/&#0?39;|&apos;/g, "'")
+        .replace(/&quot;/g, '"')
+        .replace(/&#(\d+);/g, (_m, n) => String.fromCharCode(Number(n)))
+        .replace(/\s+/g, ' ')
+        .trim();
+    const BEO_TS = /(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})\s*[\/\-–→]*\s*(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})/;
+    const BEO_TIMES_ONLY = /(\d{1,2}):(\d{2})\s*[\/\-–→]+\s*(?:[^\d]*)(\d{1,2}):(\d{2})/;
+    let beoPageTitle = '';
+    function parseBeoHtml(html) {
+        const titleM = html.match(/<h2[^>]*main-color[^>]*>\s*<strong>([^<]+)<\/strong>/i);
+        beoPageTitle = titleM ? stripTags(titleM[1]) : '';
+        // Sayfa tarihi ("30 Ekim 2026 Bugün Nöbetçi Eczaneler"): saatleri yalnızca vardiya saati verilmişse kullanılır
+        const AYLAR = ['ocak', 'şubat', 'mart', 'nisan', 'mayıs', 'haziran', 'temmuz', 'ağustos', 'eylül', 'ekim', 'kasım', 'aralık'];
+        let pageDay = null;
+        const pd = beoPageTitle.toLocaleLowerCase('tr-TR').match(/(\d{1,2})\s+([a-zçğıöşü]+)\s+(\d{4})/);
+        if (pd && AYLAR.indexOf(pd[2]) >= 0)
+            pageDay = { y: Number(pd[3]), m: AYLAR.indexOf(pd[2]), d: Number(pd[1]) };
+        const parts = html.split(/<div[^>]*class=["'][^"']*\bnobetci\b[^"']*["'][^>]*>/i);
+        const out = [];
+        const seen = new Set();
+        for (let i = 1; i < parts.length; i++) {
+            const chunk = parts[i].split(/<hr\b/i)[0];
+            // Ad ve ilçe: <h4 class="red"><strong>AD</strong> - İLÇE</h4>
+            const nm = chunk.match(/<h4[^>]*>\s*<strong>([\s\S]*?)<\/strong>\s*-\s*([\s\S]*?)<\/h4>/i);
+            if (!nm)
+                continue;
+            const name = titleCaseTr(stripTags(nm[1]));
+            const ilceParts = stripTags(nm[2]).split('-').map((x) => titleCaseTr(x)).filter(Boolean);
+            const ilce = ilceParts[0] || 'Bursa';
+            const bolge = ilceParts.slice(1).join(' - ') || undefined;
+            // Adres ve tarif: ev simgesinden telefon simgesine kadar; <br> sonrası tarif metni
+            let address = '';
+            let landmark;
+            const am = chunk.match(/fa-home[^>]*>\s*<\/i>([\s\S]*?)(?=<br\s*\/?>\s*<i[^>]*fa-phone|<i[^>]*fa-phone)/i);
+            if (am) {
+                const segs = am[1].split(/<br\s*\/?>/i).map((x) => stripTags(x)).filter(Boolean);
+                address = segs[0] || '';
+                if (segs.length > 1)
+                    landmark = segs.slice(1).join(' ').replace(/^\(|\)$/g, '').trim() || undefined;
+            }
+            if (!address)
+                continue;
+            // Telefonlar
+            const phones = Array.from(chunk.matchAll(/href=["']tel:([^"']+)["']/gi))
+                .map((m) => formatPhone(m[1].trim()))
+                .filter((v, idx, arr) => v && arr.indexOf(v) === idx);
+            if (phones.length === 0)
+                continue;
+            // Tam GPS konumu: https://www.google.com/maps?q=lat,lng
+            let lat = 0;
+            let lng = 0;
+            let approx = 'tam';
+            const mm = chunk.match(/maps\?q=(-?[0-9.]+),\s*(-?[0-9.]+)/i);
+            if (mm) {
+                lat = parseFloat(mm[1]);
+                lng = parseFloat(mm[2]);
+            }
+            if (!(lat > 39 && lat < 41.5 && lng > 28 && lng < 30.5)) {
+                const c = resolvePharmacyCoords(address, ilce);
+                lat = c.lat;
+                lng = c.lng;
+                approx = 'ilce';
+            }
+            // Nöbet saatleri: tam tarihli ("30.10.2026 18:30 / 31.10.2026 10:00") ya da yalnızca saat ("18:30 / 10:00")
+            const text = stripTags(chunk);
+            let dutyStart = 0;
+            let dutyEnd = 0;
+            const tm = text.match(BEO_TS);
+            if (tm) {
+                dutyStart = trToEpoch(tm[1], tm[2], tm[3], tm[4], tm[5]);
+                dutyEnd = trToEpoch(tm[6], tm[7], tm[8], tm[9], tm[10]);
+            }
+            else if (pageDay) {
+                const t2 = text.match(BEO_TIMES_ONLY);
+                if (t2) {
+                    const base = Date.UTC(pageDay.y, pageDay.m, pageDay.d, 0, 0) - TR_OFFSET_MS;
+                    dutyStart = base + (Number(t2[1]) * 60 + Number(t2[2])) * 60000;
+                    dutyEnd = base + (Number(t2[3]) * 60 + Number(t2[4])) * 60000;
+                    if (dutyEnd <= dutyStart)
+                        dutyEnd += 24 * 60 * 60 * 1000;
+                }
+            }
+            if (!dutyStart || !dutyEnd)
+                continue;
+            const key = `${name}|${ilce}|${dutyStart}`;
+            if (seen.has(key))
+                continue;
+            seen.add(key);
+            out.push({
+                id: `beo-${normalizeKesintiText(`${ilce}-${name}`).replace(/[^a-z0-9]+/g, '-')}-${dutyStart}`,
+                name,
+                ilce,
+                bolge,
+                address,
+                landmark,
+                phone: phones[0],
+                phones,
+                mapsUrl: mm
+                    ? `https://www.google.com/maps?q=${lat},${lng}`
+                    : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${name} ${address} Bursa`)}`,
+                lat,
+                lng,
+                approx,
+                source: 'beo',
+                dutyStart,
+                dutyEnd,
+            });
+        }
+        return out;
+    }
+    const srcCache = {
+        beo: null,
+        eczaneleri: null,
+    };
+    async function fetchHtml(url, referer) {
+        const response = await fetch(url, {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (compatible; MutlularPlusBot/1.0; +https://www.mutlularhaber.com)',
+                'User-Agent': OUR_UA,
                 Accept: 'text/html,application/xhtml+xml',
+                'Accept-Language': 'tr-TR,tr;q=0.9',
+                ...(referer ? { Referer: referer } : {}),
             },
             signal: AbortSignal.timeout(8000),
         });
         if (!response.ok)
-            throw new Error(`Kaynak yanıt vermedi (${response.status})`);
-        const html = await response.text();
+            throw new Error(`yanıt ${response.status}`);
+        return response.text();
+    }
+    async function loadBeo() {
+        const c = srcCache.beo;
+        if (c && Date.now() - c.at < SOURCE_TTL_MS)
+            return c.list;
+        const html = await fetchHtml(BEO_URL);
+        let list = parseBeoHtml(html);
+        if (list.length === 0)
+            throw new Error(`okunamadı (sayfa ${html.length} bayt)`);
+        srcCache.beo = { at: Date.now(), list };
+        return list;
+    }
+    async function loadEczaneleri() {
+        const c = srcCache.eczaneleri;
+        if (c && Date.now() - c.at < SOURCE_TTL_MS)
+            return c.list;
+        const html = await fetchHtml(ECZANE_SOURCE_URL);
         let list = parseEczaneleriOrg(html);
         if (list.length === 0)
             list = parseEczaneFlat(html);
-        if (list.length === 0) {
-            throw new Error(`Liste okunamadı (sayfa ${html.length} bayt, biçim beklenenden farklı olabilir)`);
-        }
-        eczaneCache = { fetchedAt: now, list };
+        if (list.length === 0)
+            throw new Error(`okunamadı (sayfa ${html.length} bayt)`);
+        srcCache.eczaneleri = { at: Date.now(), list };
         return list;
+    }
+    async function loadEczaneList() {
+        const [b, e] = await Promise.allSettled([loadBeo(), loadEczaneleri()]);
+        const notes = [];
+        const used = [];
+        const beo = b.status === 'fulfilled' ? b.value : [];
+        const ecz = e.status === 'fulfilled' ? e.value : [];
+        if (b.status === 'rejected')
+            notes.push(`BEO: ${b.reason.message}`);
+        else
+            used.push('beo');
+        if (e.status === 'rejected')
+            notes.push(`eczaneleri.org: ${e.reason.message}`);
+        else
+            used.push('eczaneleri');
+        if (beo.length === 0 && ecz.length === 0)
+            throw new Error(notes.join(' | ') || 'kaynak yok');
+        const nameKey = (p) => `${normalizeKesintiText(p.name)}|${normalizeKesintiText(p.ilce)}`;
+        const shiftKey = (p) => `${nameKey(p)}|${p.dutyStart}`;
+        const beoByName = new Map();
+        beo.forEach((p) => beoByName.set(nameKey(p), p));
+        const beoShifts = new Set(beo.map(shiftKey));
+        const merged = [...beo];
+        ecz.forEach((p) => {
+            if (beoShifts.has(shiftKey(p)))
+                return; // aynı nöbet zaten resmi kaynaktan var
+            const known = beoByName.get(nameKey(p));
+            // Aynı eczane resmi listede başka bir saatte varsa tam konumunu ve tarifini ödünç al
+            merged.push(known
+                ? { ...p, lat: known.lat, lng: known.lng, approx: known.approx, landmark: known.landmark, phones: known.phones, phone: known.phone, mapsUrl: known.mapsUrl, address: known.address }
+                : p);
+        });
+        return { list: merged, used, notes };
     }
     app.get('/api/nobetci-eczaneler', async (req, res) => {
         try {
-            const all = await loadEczaneList();
+            const { list: all, used, notes } = await loadEczaneList();
             const now = Date.now();
             const WINDOW_MS = 12 * 60 * 60 * 1000;
             const ilceParam = typeof req.query.ilce === 'string' ? req.query.ilce : '';
@@ -1258,11 +1442,14 @@ function registerRoutes(app) {
                     ilce: p.ilce,
                     bolge: p.bolge,
                     address: p.address,
+                    landmark: p.landmark,
                     phone: p.phone,
+                    phones: p.phones,
                     mapsUrl: p.mapsUrl,
                     lat: p.lat,
                     lng: p.lng,
                     approx: p.approx,
+                    source: p.source,
                     dutyStart: new Date(p.dutyStart).toISOString(),
                     dutyEnd: new Date(p.dutyEnd).toISOString(),
                     dutyLabel: `${fmt(p.dutyStart)} → ${fmt(p.dutyEnd)}`,
@@ -1273,10 +1460,12 @@ function registerRoutes(app) {
             const trNow = new Date(now + TR_OFFSET_MS);
             return res.json({
                 success: true,
-                source: 'LIVE_ECZANELERI_ORG',
-                sourceUrl: ECZANE_SOURCE_URL,
+                source: used.includes('beo') ? 'BURSA_ECZACI_ODASI' : 'LIVE_ECZANELERI_ORG',
+                sources: used,
+                sourceNotes: notes,
+                sourceUrl: used.includes('beo') ? BEO_URL : ECZANE_SOURCE_URL,
+                pageTitle: beoPageTitle || undefined,
                 date: `${String(trNow.getUTCDate()).padStart(2, '0')}.${String(trNow.getUTCMonth() + 1).padStart(2, '0')}.${trNow.getUTCFullYear()} ${String(trNow.getUTCHours()).padStart(2, '0')}:${String(trNow.getUTCMinutes()).padStart(2, '0')}`,
-                fetchedAt: eczaneCache ? new Date(eczaneCache.fetchedAt).toISOString() : undefined,
                 count: pharmacies.filter((p) => p.status === 'nobette').length,
                 pharmacies,
             });
