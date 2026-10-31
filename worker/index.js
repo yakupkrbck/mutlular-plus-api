@@ -46,7 +46,9 @@ var CHECKS=[
  ['Nöbetçi eczaneler','/api/nobetci-eczaneler?ilce=osmangazi'],
  ['Canlı otobüs (15H)','/api/burulas/realtime/15H'],
  ['Duraklar (15H)','/api/burulas/stops/15H'],
- ['Sefer saatleri (15H)','/api/burulas/schedule/15H']
+ ['Sefer saatleri (15H)','/api/burulas/schedule/15H'],
+ ['Bildirim sunucusu ayarı (FCM)','/api/push/status'],
+ ['Fotoğraf yükleme imzası ayarı','/api/upload-status']
 ];
 function countItems(j){
   if(Array.isArray(j)) return j.length;
@@ -1641,6 +1643,15 @@ export default {
         }
         if (request.method === 'OPTIONS')
             return new Response(null, { status: 204, headers: cors });
+        if (url.pathname === '/api/push/status' || url.pathname === '/api/upload-status') {
+            const isPush = url.pathname === '/api/push/status';
+            const ok = isPush ? !!(env && env.FCM_SERVICE_ACCOUNT) : !!(env && env.CLOUDINARY_API_KEY && env.CLOUDINARY_API_SECRET);
+            return new Response(JSON.stringify({
+                success: ok,
+                configured: ok,
+                error: ok ? undefined : isPush ? 'Cloudflare\'de FCM_SERVICE_ACCOUNT secret\'ı eksik' : 'Cloudflare\'de CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET secret\'ları eksik',
+            }), { headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...cors } });
+        }
         if ((url.pathname === '/api/push/register' || url.pathname === '/api/push/send') && request.method === 'POST') {
             return handlePush(request, env, cors, url.pathname);
         }
