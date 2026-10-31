@@ -46,7 +46,9 @@ var CHECKS=[
  ['Nöbetçi eczaneler','/api/nobetci-eczaneler?ilce=osmangazi'],
  ['Canlı otobüs (15H)','/api/burulas/realtime/15H'],
  ['Duraklar (15H)','/api/burulas/stops/15H'],
- ['Sefer saatleri (15H)','/api/burulas/schedule/15H']
+ ['Sefer saatleri (15H)','/api/burulas/schedule/15H'],
+ ['Bildirim sunucusu ayarı (FCM)','/api/push/status'],
+ ['Fotoğraf yükleme imzası ayarı','/api/upload-status']
 ];
 function countItems(j){
   if(Array.isArray(j)) return j.length;
@@ -207,6 +209,146 @@ async function handleUploadSignature(request, env, cors) {
         allowedFormats: ALLOWED_FORMATS,
         signature,
     });
+}
+// ---------------------------------------------------------------------------
+// Push bildirimleri (FCM, ücretsiz): cihazlar "tum" konusuna abone edilir; yönetici tek istekle hepsine gönderir.
+// Gizli değer Cloudflare'de Secret olarak tutulur (repoda YOK):
+//   FCM_SERVICE_ACCOUNT  → Firebase hizmet hesabı JSON'unun tamamı
+// ---------------------------------------------------------------------------
+const PUSH_TOPIC = 'tum';
+const PUSH_ADMIN_ROLES = ['admin', 'yonetici', 'editor'];
+let saTokenCache = null;
+const pushCounters = new Map();
+function b64urlFromBytes(bytes) {
+    const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    let bin = '';
+    for (let i = 0; i < arr.length; i++)
+        bin += String.fromCharCode(arr[i]);
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function pemToDer(pem) {
+    const b64 = pem.replace(/-----BEGIN [^-]+-----/, '').replace(/-----END [^-]+-----/, '').replace(/\s+/g, '');
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++)
+        out[i] = bin.charCodeAt(i);
+    return out;
+}
+// Hizmet hesabı ile Google OAuth erişim anahtarı (RS256 JWT → token)
+async function getServiceAccountToken(env) {
+    const now = Date.now();
+    if (saTokenCache && saTokenCache.exp > now + 60_000)
+        return saTokenCache.token;
+    const sa = JSON.parse(env.FCM_SERVICE_ACCOUNT);
+    const iat = Math.floor(now / 1000);
+    const header = b64urlFromBytes(new TextEncoder().encode(JSON.stringify({ alg: 'RS256', typ: 'JWT' })));
+    const claims = b64urlFromBytes(new TextEncoder().encode(JSON.stringify({
+        iss: sa.client_email,
+        scope: 'https://www.googleapis.com/auth/firebase.messaging https://www.googleapis.com/auth/cloud-platform',
+        aud: 'https://oauth2.googleapis.com/token',
+        iat,
+        exp: iat + 3600,
+    })));
+    const key = await crypto.subtle.importKey('pkcs8', pemToDer(sa.private_key), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']);
+    const sig = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, new TextEncoder().encode(`${header}.${claims}`));
+    const assertion = `${header}.${claims}.${b64urlFromBytes(sig)}`;
+    const res = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: `grant_type=${encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer')}&assertion=${assertion}`,
+    });
+    if (!res.ok)
+        throw new Error('Google yetkilendirme başarısız (' + res.status + ')');
+    const json = await res.json();
+    saTokenCache = { token: json.access_token, exp: now + (json.expires_in || 3600) * 1000 };
+    return json.access_token;
+}
+function pushRateOk(key, limit) {
+    const now = Date.now();
+    const c = pushCounters.get(key);
+    if (!c || c.reset < now) {
+        pushCounters.set(key, { n: 1, reset: now + 3600_000 });
+        return true;
+    }
+    return ++c.n <= limit;
+}
+async function handlePush(request, env, cors, path) {
+    const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json; charset=utf-8', ...cors } });
+    if (!env || !env.FCM_SERVICE_ACCOUNT)
+        return json({ success: false, error: 'push_not_configured' }, 503);
+    const auth = request.headers.get('Authorization') || '';
+    const idToken = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    const user = idToken ? await verifyFirebaseToken(idToken) : null;
+    if (!user)
+        return json({ success: false, error: 'Giriş gerekli.' }, 401);
+    let body = {};
+    try {
+        body = await request.json();
+    }
+    catch {
+        body = {};
+    }
+    try {
+        // ---- Cihaz kaydı: FCM jetonunu "tum" konusuna abone et
+        if (path === '/api/push/register') {
+            if (!pushRateOk('reg:' + user.uid, 30))
+                return json({ success: false, error: 'Çok fazla istek.' }, 429);
+            const token = typeof body.token === 'string' ? body.token : '';
+            if (token.length < 50 || token.length > 4096)
+                return json({ success: false, error: 'Geçersiz cihaz jetonu.' }, 400);
+            const access = await getServiceAccountToken(env);
+            const res = await fetch('https://iid.googleapis.com/iid/v1:batchAdd', {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json', access_token_auth: 'true' },
+                body: JSON.stringify({ to: `/topics/${PUSH_TOPIC}`, registration_tokens: [token] }),
+            });
+            const out = await res.json().catch(() => ({}));
+            const err = out?.results?.[0]?.error || (!res.ok ? out?.error || 'HTTP ' + res.status : null);
+            if (err)
+                return json({ success: false, error: 'Abonelik başarısız: ' + String(err) }, 502);
+            return json({ success: true });
+        }
+        // ---- Tüm cihazlara gönder (yalnızca yönetim)
+        if (path === '/api/push/send') {
+            // Yönetici kontrolü: kullanıcının KENDİ kimliğiyle admins/{uid} belgesini okumayı dener (kurallar yalnızca kendi belgesine izin verir)
+            const docRes = await fetch(`https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/admins/${encodeURIComponent(user.uid)}`, { headers: { Authorization: `Bearer ${idToken}` } });
+            if (!docRes.ok)
+                return json({ success: false, error: 'Bu işlem için yetkiniz yok.' }, 403);
+            const adminDoc = await docRes.json().catch(() => ({}));
+            const role = adminDoc?.fields?.role?.stringValue || 'admin';
+            if (!PUSH_ADMIN_ROLES.includes(role))
+                return json({ success: false, error: 'Bu işlem için yetkiniz yok.' }, 403);
+            if (!pushRateOk('send:' + user.uid, 30))
+                return json({ success: false, error: 'Çok fazla bildirim gönderildi. Biraz sonra deneyin.' }, 429);
+            const title = String(body.title || '').trim().slice(0, 100);
+            const text = String(body.body || '').trim().slice(0, 300);
+            if (!title || !text)
+                return json({ success: false, error: 'Başlık ve mesaj gerekli.' }, 400);
+            const actionTab = typeof body.actionTab === 'string' ? body.actionTab.slice(0, 30) : 'profil';
+            const access = await getServiceAccountToken(env);
+            const res = await fetch(`https://fcm.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/messages:send`, {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    message: {
+                        topic: PUSH_TOPIC,
+                        notification: { title, body: text },
+                        data: { type: 'duyuru', actionTab, subTab: 'bildirimler' },
+                        webpush: { headers: { Urgency: 'high', TTL: '86400' } },
+                        android: { priority: 'HIGH', ttl: '86400s' },
+                    },
+                }),
+            });
+            const out = await res.json().catch(() => ({}));
+            if (!res.ok)
+                return json({ success: false, error: 'Gönderilemedi: ' + (out?.error?.message || res.status) }, 502);
+            return json({ success: true, messageId: out?.name });
+        }
+    }
+    catch (e) {
+        return json({ success: false, error: 'Push hatası: ' + (e?.message || 'bilinmiyor') }, 500);
+    }
+    return json({ success: false, error: 'Bulunamadı' }, 404);
 }
 const routes = [];
 const app = {
@@ -1501,6 +1643,18 @@ export default {
         }
         if (request.method === 'OPTIONS')
             return new Response(null, { status: 204, headers: cors });
+        if (url.pathname === '/api/push/status' || url.pathname === '/api/upload-status') {
+            const isPush = url.pathname === '/api/push/status';
+            const ok = isPush ? !!(env && env.FCM_SERVICE_ACCOUNT) : !!(env && env.CLOUDINARY_API_KEY && env.CLOUDINARY_API_SECRET);
+            return new Response(JSON.stringify({
+                success: ok,
+                configured: ok,
+                error: ok ? undefined : isPush ? 'Cloudflare\'de FCM_SERVICE_ACCOUNT secret\'ı eksik' : 'Cloudflare\'de CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET secret\'ları eksik',
+            }), { headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...cors } });
+        }
+        if ((url.pathname === '/api/push/register' || url.pathname === '/api/push/send') && request.method === 'POST') {
+            return handlePush(request, env, cors, url.pathname);
+        }
         if (url.pathname === '/api/upload-signature' && request.method === 'POST') {
             return handleUploadSignature(request, env, cors);
         }
