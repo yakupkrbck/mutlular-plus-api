@@ -478,7 +478,7 @@ async function sendTopic(env, d) {
             message: {
                 topic: d.topic,
                 notification: { title: d.title.slice(0, 100), body: d.body.slice(0, 300) },
-                data: { type: d.notifType, actionTab: d.actionTab || 'profil', subTab: d.subTab || 'bildirimler' },
+                data: { type: d.notifType, actionTab: d.actionTab || 'profil', subTab: d.subTab || 'bildirimler', ...(d.relatedId ? { relatedId: String(d.relatedId).slice(0, 120) } : {}) },
                 webpush: { headers: { Urgency: 'high', TTL: '86400' } },
                 android: { priority: 'HIGH', ttl: '86400s' },
             },
@@ -498,6 +498,8 @@ async function deliver(env, d) {
         date: trDateLabel(now),
         read: false,
         actionTab: d.actionTab || 'profil',
+        subTab: d.subTab || undefined,
+        relatedId: d.relatedId ? String(d.relatedId).slice(0, 120) : undefined,
         createdAtMs: now,
         sender: 'Mutlular Plus',
     };
@@ -747,7 +749,9 @@ const EVENTS = {
                     title: d.tip === 'Elektrik' ? '⚡ Elektrik Kesintisi' : '💧 Su Kesintisi',
                     body: `${clip(d.mahalle, 80)} • ${clip(d.tarih, 30)} ${clip(d.saat, 30)}${d.aciklama ? ' — ' + clip(d.aciklama, 120) : ''}`,
                     notifType: 'duyuru',
-                    actionTab: 'anasayfa',
+                    // Dokununca Kesintiler açılır: elektrik → UEDAŞ sekmesi, su → BUSKİ sekmesi
+                    actionTab: 'kesinti',
+                    subTab: d.tip === 'Elektrik' ? 'uedas' : 'buski',
                     broadcast: true,
                 },
             ],
@@ -903,6 +907,8 @@ async function handlePush(request, env, cors, path) {
                 body: text,
                 notifType: 'duyuru',
                 actionTab: typeof body.actionTab === 'string' ? body.actionTab.slice(0, 30) : 'profil',
+                subTab: typeof body.subTab === 'string' ? body.subTab.slice(0, 30) : undefined,
+                relatedId: typeof body.relatedId === 'string' ? body.relatedId.slice(0, 120) : undefined,
             });
             return json({ success: true });
         }
