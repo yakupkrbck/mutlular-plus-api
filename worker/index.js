@@ -392,8 +392,15 @@ async function fsCommit(env, writes) {
         headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ writes }),
     });
-    return { ok: res.ok, status: res.status };
+    let error = '';
+    if (!res.ok) {
+        const out = await res.json().catch(() => ({}));
+        error = String(out?.error?.status || out?.error?.message || '');
+    }
+    return { ok: res.ok, status: res.status, error };
 }
+// Belge zaten varsa (exists:false koşulu) Firestore 409 / ALREADY_EXISTS / FAILED_PRECONDITION döner
+const fsIsDuplicate = (w) => w.status === 409 || w.error === 'ALREADY_EXISTS' || w.error === 'FAILED_PRECONDITION';
 async function fsRunQuery(env, structuredQuery) {
     const access = await getServiceAccountToken(env);
     const res = await fetch(`${FS_BASE}:runQuery`, {
@@ -503,8 +510,11 @@ async function deliver(env, d) {
         const id = `n-${now.toString(36)}-${i}-${Math.random().toString(36).slice(2, 5)}`;
         writes.push({ update: { name: `${FS_ROOT}/plus_users/${uid}/bildirimler/${id}`, fields: fsFields({ ...base, id }) } });
     });
-    if (writes.length)
-        await fsCommit(env, writes);
+    if (writes.length) {
+        const w = await fsCommit(env, writes);
+        if (!w.ok)
+            console.error('[deliver] uygulama içi bildirim kaydı yazılamadı', w.status, w.error);
+    }
     await sendTopic(env, d);
 }
 async function adminUids(env) {
@@ -793,8 +803,11 @@ async function scanKesinti(env, which) {
             };
             // Yalnızca ilk kez görülüyorsa oluştur (belge zaten varsa 409 döner → bildirim tekrarlanmaz)
             const w = await fsCommit(env, [{ update: { name: `${FS_ROOT}/plus_kesinti_onay/${docId}`, fields: fsFields(fields) }, currentDocument: { exists: false } }]);
-            if (!w.ok)
+            if (!w.ok) {
+                if (!fsIsDuplicate(w))
+                    console.error('[kesinti-tara] Firestore yazma hatası', w.status, w.error);
                 continue;
+            }
             yeni++;
             await deliver(env, {
                 topic: 'staff',
@@ -860,7 +873,7 @@ async function handlePush(request, env, cors, path) {
             }
             if (errors.length === topics.length)
                 return json({ success: false, error: 'Abonelik başarısız: ' + errors[0] }, 502);
-            return json({ success: true, topics: topics.length });
+            return json({ success: true, topics: topics.length, failed: errors.length ? errors : undefined });
         }
         // ---- Çıkış: kişiye özel / yönetim / usta konularından çıkar ("tum" kalır)
         if (path === '/api/push/unregister') {
@@ -875,7 +888,8 @@ async function handlePush(request, env, cors, path) {
         }
         // ---- Yönetim duyurusu: tüm cihazlara
         if (path === '/api/push/send') {
-            if (!(await staffRole()) || !['admin', 'yonetici', 'editor'].includes((await staffRole())))
+            const sendRole = await staffRole();
+            if (!sendRole || !['admin', 'yonetici', 'editor'].includes(sendRole))
                 return json({ success: false, error: 'Bu işlem için yetkiniz yok.' }, 403);
             if (!pushRateOk('send:' + user.uid, 30))
                 return json({ success: false, error: 'Çok fazla bildirim gönderildi. Biraz sonra deneyin.' }, 429);
@@ -913,17 +927,29 @@ async function handlePush(request, env, cors, path) {
                 return json({ success: false, error: 'Olay doğrulanamadı.' }, 403);
             // Aynı olay yalnızca bir kez işlenir
             const logId = await sha1Short(ev.dedupKey);
+            const logName = `${FS_ROOT}/plus_push_log/${logId}`;
             const log = await fsCommit(env, [
-                { update: { name: `${FS_ROOT}/plus_push_log/${logId}`, fields: fsFields({ key: ev.dedupKey, atMs: Date.now() }) }, currentDocument: { exists: false } },
+                { update: { name: logName, fields: fsFields({ key: ev.dedupKey, atMs: Date.now() }) }, currentDocument: { exists: false } },
             ]);
-            if (!log.ok)
-                return json({ success: true, skipped: true });
-            const deliveries = await ev.deliveries();
-            for (const d of deliveries)
-                await deliver(env, d);
-            if (ev.after)
-                await ev.after();
-            return json({ success: true, sent: deliveries.length });
+            if (!log.ok) {
+                // Yalnızca "zaten işlendi" durumu atlanır; yetki / sunucu hatası sessizce yutulmaz
+                if (fsIsDuplicate(log))
+                    return json({ success: true, skipped: true });
+                throw new Error('Firestore kayıt hatası ' + log.status + (log.error ? ' ' + log.error : ''));
+            }
+            try {
+                const deliveries = await ev.deliveries();
+                for (const d of deliveries)
+                    await deliver(env, d);
+                if (ev.after)
+                    await ev.after();
+                return json({ success: true, sent: deliveries.length });
+            }
+            catch (err) {
+                // Gönderim patladıysa kaydı sil ki olay tekrar denenebilsin
+                await fsCommit(env, [{ delete: logName }]).catch(() => { });
+                throw err;
+            }
         }
         // ---- Kesinti taramasını elle çalıştır (yalnızca yönetim)
         if (path === '/api/push/kesinti-tara') {
