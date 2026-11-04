@@ -227,19 +227,69 @@ function b64urlFromBytes(bytes) {
     return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 function pemToDer(pem) {
-    const b64 = pem.replace(/-----BEGIN [^-]+-----/, '').replace(/-----END [^-]+-----/, '').replace(/\s+/g, '');
+    const b64 = String(pem).replace(/\\n/g, '\n').replace(/-----BEGIN [^-]+-----/, '').replace(/-----END [^-]+-----/, '').replace(/\s+/g, '');
     const bin = atob(b64);
     const out = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++)
         out[i] = bin.charCodeAt(i);
     return out;
 }
+// Secret yapıştırılırken private_key içine gerçek satır sonu / sekme girebilir ("Bad control character").
+// Bu yardımcı, string içindeki kontrol karakterlerini kaçışlayarak JSON'u güvenle çözer.
+function parseServiceAccount(raw) {
+    let txt = String(raw || '').replace(/^\uFEFF/, '').trim();
+    try {
+        return JSON.parse(txt);
+    }
+    catch { }
+    let out = '';
+    let inStr = false;
+    let esc = false;
+    for (let i = 0; i < txt.length; i++) {
+        const ch = txt[i];
+        if (inStr) {
+            if (esc) {
+                out += ch;
+                esc = false;
+            }
+            else if (ch === '\\') {
+                out += ch;
+                esc = true;
+            }
+            else if (ch === '"') {
+                out += ch;
+                inStr = false;
+            }
+            else if (ch === '\n') {
+                out += '\\n';
+            }
+            else if (ch === '\r') {
+                out += '';
+            }
+            else if (ch === '\t') {
+                out += '\\t';
+            }
+            else if (ch.charCodeAt(0) < 0x20) {
+                out += '';
+            }
+            else {
+                out += ch;
+            }
+        }
+        else {
+            if (ch === '"')
+                inStr = true;
+            out += ch;
+        }
+    }
+    return JSON.parse(out);
+}
 // Hizmet hesabı ile Google OAuth erişim anahtarı (RS256 JWT → token)
 async function getServiceAccountToken(env) {
     const now = Date.now();
     if (saTokenCache && saTokenCache.exp > now + 60_000)
         return saTokenCache.token;
-    const sa = JSON.parse(env.FCM_SERVICE_ACCOUNT);
+    const sa = parseServiceAccount(env.FCM_SERVICE_ACCOUNT);
     const iat = Math.floor(now / 1000);
     const header = b64urlFromBytes(new TextEncoder().encode(JSON.stringify({ alg: 'RS256', typ: 'JWT' })));
     const claims = b64urlFromBytes(new TextEncoder().encode(JSON.stringify({
