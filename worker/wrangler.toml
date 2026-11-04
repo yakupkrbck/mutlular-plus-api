@@ -1,0 +1,7 @@
+name = "mutlular-plus-api"
+main = "index.js"
+compatibility_date = "2026-10-01"
+
+# Kesinti taraması: UEDAŞ her 15 dakikada (0,15,30,45), BUSKİ 7 dakika arayla (7,22,37,52)
+[triggers]
+crons = ["0,15,30,45 * * * *", "7,22,37,52 * * * *"]

@@ -272,6 +272,496 @@ function pushRateOk(key, limit) {
     }
     return ++c.n <= limit;
 }
+// ---------------------------------------------------------------------------
+// Firestore REST yardımcıları (Worker, hizmet hesabıyla yazar/okur; kullanıcı adına okumalar kullanıcının kendi jetonuyla yapılır)
+// ---------------------------------------------------------------------------
+const FS_ROOT = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents`;
+const FS_BASE = `https://firestore.googleapis.com/v1/${FS_ROOT}`;
+function fsEncode(v) {
+    if (v === null || v === undefined)
+        return { nullValue: null };
+    if (typeof v === 'string')
+        return { stringValue: v };
+    if (typeof v === 'boolean')
+        return { booleanValue: v };
+    if (typeof v === 'number')
+        return Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
+    if (Array.isArray(v))
+        return { arrayValue: { values: v.map(fsEncode) } };
+    if (typeof v === 'object') {
+        const fields = {};
+        Object.keys(v).forEach((k) => {
+            if (v[k] !== undefined)
+                fields[k] = fsEncode(v[k]);
+        });
+        return { mapValue: { fields } };
+    }
+    return { stringValue: String(v) };
+}
+function fsDecodeValue(v) {
+    if (!v)
+        return null;
+    if ('stringValue' in v)
+        return v.stringValue;
+    if ('integerValue' in v)
+        return Number(v.integerValue);
+    if ('doubleValue' in v)
+        return v.doubleValue;
+    if ('booleanValue' in v)
+        return v.booleanValue;
+    if ('nullValue' in v)
+        return null;
+    if ('timestampValue' in v)
+        return v.timestampValue;
+    if ('arrayValue' in v)
+        return (v.arrayValue.values || []).map(fsDecodeValue);
+    if ('mapValue' in v)
+        return fsDecodeFields(v.mapValue.fields || {});
+    return null;
+}
+function fsDecodeFields(f) {
+    const o = {};
+    Object.keys(f || {}).forEach((k) => (o[k] = fsDecodeValue(f[k])));
+    return o;
+}
+const fsFields = (obj) => fsEncode(obj).mapValue.fields;
+/** Kullanıcının KENDİ kimliğiyle okur: Firestore kuralları geçerlidir (yalnızca görmesi gerekeni görür). */
+async function fsGetAsUser(path, idToken) {
+    const res = await fetch(`${FS_BASE}/${path}`, { headers: { Authorization: `Bearer ${idToken}` } });
+    if (res.status === 404 || res.status === 403)
+        return null;
+    if (!res.ok)
+        throw new Error('Firestore okuma hatası ' + res.status);
+    const doc = await res.json();
+    return { ...fsDecodeFields(doc.fields || {}), __id: String(doc.name || '').split('/').pop() };
+}
+async function fsCommit(env, writes) {
+    const access = await getServiceAccountToken(env);
+    const res = await fetch(`${FS_BASE}:commit`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ writes }),
+    });
+    return { ok: res.ok, status: res.status };
+}
+async function fsRunQuery(env, structuredQuery) {
+    const access = await getServiceAccountToken(env);
+    const res = await fetch(`${FS_BASE}:runQuery`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ structuredQuery }),
+    });
+    if (!res.ok)
+        throw new Error('Firestore sorgu hatası ' + res.status);
+    const rows = await res.json();
+    return rows.filter((r) => r.document).map((r) => ({ ...fsDecodeFields(r.document.fields || {}), __id: String(r.document.name).split('/').pop() }));
+}
+async function sha1Short(text) {
+    return (await sha1Hex(text)).slice(0, 24);
+}
+// ---------------------------------------------------------------------------
+// Konular (topics): cihaz, kullanıcının rolüne göre abone edilir; olaylar doğru kişilere konu üzerinden gider.
+//   tum            → herkes (yönetim duyuruları, onaylı kesintiler)
+//   u-<uid>        → yalnızca o kullanıcı (teklif, onay sonucu...)
+//   staff          → yönetici / editör / muhtar (onay bekleyen kayıtlar)
+//   usta-<alanId>  → o hizmet alanında çalışan ustalar (yeni talepler)
+// ---------------------------------------------------------------------------
+const STAFF_ROLES_ALL = ['admin', 'yonetici', 'editor', 'muhtar'];
+function slugAlan(name) {
+    return (name || '')
+        .trim()
+        .toLocaleLowerCase('tr-TR')
+        .replace(/ğ/g, 'g').replace(/ü/g, 'u').replace(/ş/g, 's').replace(/ı/g, 'i').replace(/ö/g, 'o').replace(/ç/g, 'c')
+        .replace(/&/g, ' ')
+        .replace(/[^a-z0-9\s-]/g, '')
+        .replace(/\s+/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-|-$/g, '')
+        .slice(0, 60);
+}
+async function iidBatch(access, op, topic, token) {
+    const res = await fetch(`https://iid.googleapis.com/iid/v1:${op}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json', access_token_auth: 'true' },
+        body: JSON.stringify({ to: `/topics/${topic}`, registration_tokens: [token] }),
+    });
+    const out = await res.json().catch(() => ({}));
+    return out?.results?.[0]?.error || (!res.ok ? out?.error || 'HTTP ' + res.status : null);
+}
+async function desiredTopics(uid, idToken) {
+    const topics = ['tum', `u-${uid}`];
+    const managed = [`u-${uid}`];
+    const [profile, adm] = await Promise.all([fsGetAsUser(`plus_users/${uid}`, idToken), fsGetAsUser(`admins/${uid}`, idToken)]);
+    if (adm) {
+        topics.push('staff');
+        managed.push('staff');
+    }
+    if (profile && profile.role === 'usta' && Array.isArray(profile.activities)) {
+        profile.activities.slice(0, 12).forEach((a) => {
+            const id = slugAlan(a);
+            if (id) {
+                topics.push(`usta-${id}`);
+                managed.push(`usta-${id}`);
+            }
+        });
+    }
+    return { topics, managed };
+}
+function trDateLabel(ms) {
+    const d = new Date(ms + 3 * 3600 * 1000);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${p(d.getUTCDate())}.${p(d.getUTCMonth() + 1)} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+}
+async function sendTopic(env, d) {
+    const access = await getServiceAccountToken(env);
+    const res = await fetch(`https://fcm.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/messages:send`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            message: {
+                topic: d.topic,
+                notification: { title: d.title.slice(0, 100), body: d.body.slice(0, 300) },
+                data: { type: d.notifType, actionTab: d.actionTab || 'profil', subTab: d.subTab || 'bildirimler' },
+                webpush: { headers: { Urgency: 'high', TTL: '86400' } },
+                android: { priority: 'HIGH', ttl: '86400s' },
+            },
+        }),
+    });
+    if (!res.ok) {
+        const out = await res.json().catch(() => ({}));
+        throw new Error('FCM: ' + (out?.error?.message || res.status));
+    }
+}
+async function deliver(env, d) {
+    const now = Date.now();
+    const base = {
+        type: d.notifType,
+        title: d.title.slice(0, 100),
+        message: d.body.slice(0, 300),
+        date: trDateLabel(now),
+        read: false,
+        actionTab: d.actionTab || 'profil',
+        createdAtMs: now,
+        sender: 'Mutlular Plus',
+    };
+    const writes = [];
+    if (d.broadcast) {
+        const id = `duyuru-${now}-${Math.random().toString(36).slice(2, 6)}`;
+        writes.push({ update: { name: `${FS_ROOT}/plus_duyurular/${id}`, fields: fsFields({ ...base, id }) } });
+    }
+    (d.uids || []).slice(0, 200).forEach((uid, i) => {
+        const id = `n-${now.toString(36)}-${i}-${Math.random().toString(36).slice(2, 5)}`;
+        writes.push({ update: { name: `${FS_ROOT}/plus_users/${uid}/bildirimler/${id}`, fields: fsFields({ ...base, id }) } });
+    });
+    if (writes.length)
+        await fsCommit(env, writes);
+    await sendTopic(env, d);
+}
+async function adminUids(env) {
+    const rows = await fsRunQuery(env, { from: [{ collectionId: 'admins' }], limit: 50 });
+    return rows.map((r) => r.__id);
+}
+async function ustaUidsForField(env, categoryName) {
+    const rows = await fsRunQuery(env, {
+        from: [{ collectionId: 'plus_users' }],
+        where: { fieldFilter: { field: { fieldPath: 'activities' }, op: 'ARRAY_CONTAINS', value: { stringValue: categoryName } } },
+        limit: 200,
+    });
+    return rows.filter((r) => r.role === 'usta').map((r) => r.__id);
+}
+const clip = (t, n) => String(t ?? '').replace(/\s+/g, ' ').trim().slice(0, n);
+const EVENTS = {
+    // Hizmet: talep açıldı → o alandaki ustalara
+    'talep-olustu': async (c) => {
+        const q = await c.get(`plus_talepler/${clip(c.body.id, 80)}`);
+        if (!q || q.ownerUid !== c.uid || !q.category)
+            return null;
+        return {
+            dedupKey: `talep-olustu:${q.__id}`,
+            deliveries: async () => [
+                {
+                    topic: `usta-${slugAlan(q.categoryId || q.category)}`,
+                    title: `🔨 Yeni talep: ${clip(q.category, 60)}`,
+                    body: `${clip(q.subCategory, 80)} • ${clip(q.urgency, 40)}. Teklif vermek için dokunun.`,
+                    notifType: 'teklif',
+                    actionTab: 'hizmet',
+                    uids: await ustaUidsForField(c.env, q.category),
+                },
+            ],
+        };
+    },
+    // Hizmet: usta teklif verdi → talep sahibine (onay için)
+    'teklif-verildi': async (c) => {
+        const q = await c.get(`plus_talepler/${clip(c.body.id, 80)}`);
+        const offerId = clip(c.body.offerId, 120);
+        const offer = q && Array.isArray(q.offers) ? q.offers.find((o) => o.id === offerId && o.ustaUid === c.uid) : null;
+        if (!q || !offer || !q.ownerUid)
+            return null;
+        return {
+            dedupKey: `teklif-verildi:${q.__id}:${offerId}`,
+            deliveries: async () => [
+                {
+                    topic: `u-${q.ownerUid}`,
+                    title: '💼 Talebinize teklif geldi',
+                    body: `${clip(offer.masterTitle, 40)} • ${clip(offer.price, 30)} — ${clip(q.subCategory, 60)}. Onaylamak için dokunun.`,
+                    notifType: 'teklif',
+                    actionTab: 'tekliflerim',
+                    uids: [q.ownerUid],
+                },
+            ],
+        };
+    },
+    // Hizmet: talep sahibi teklifi onayladı → seçilen ustaya (+ diğer ustalara bilgi)
+    'teklif-kabul': async (c) => {
+        const q = await c.get(`plus_talepler/${clip(c.body.id, 80)}`);
+        if (!q || q.ownerUid !== c.uid || !q.acceptedOffer?.ustaUid)
+            return null;
+        return {
+            dedupKey: `teklif-kabul:${q.__id}:${q.acceptedOffer.id}`,
+            deliveries: async () => {
+                const out = [
+                    {
+                        topic: `u-${q.acceptedOffer.ustaUid}`,
+                        title: '✅ Teklifiniz kabul edildi',
+                        body: `${clip(q.subCategory, 70)} için teklifiniz seçildi. Müşteri iletişim bilgisi artık açık.`,
+                        notifType: 'teklif',
+                        actionTab: 'hizmet',
+                        uids: [q.acceptedOffer.ustaUid],
+                    },
+                ];
+                (q.offers || [])
+                    .filter((o) => o.ustaUid && o.ustaUid !== q.acceptedOffer.ustaUid)
+                    .slice(0, 8)
+                    .forEach((o) => out.push({
+                    topic: `u-${o.ustaUid}`,
+                    title: 'Talep sonuçlandı',
+                    body: `${clip(q.subCategory, 70)} talebi başka bir usta ile sonuçlandı.`,
+                    notifType: 'teklif',
+                    actionTab: 'hizmet',
+                    uids: [o.ustaUid],
+                }));
+                return out;
+            },
+        };
+    },
+    // İlan: onay bekliyor → yönetime; sonuç → ilan sahibine
+    'ilan-bekliyor': async (c) => {
+        const d = await c.get(`plus_ilanlar/${clip(c.body.id, 80)}`);
+        if (!d || d.ownerUid !== c.uid || d.status !== 'pending')
+            return null;
+        return {
+            dedupKey: `ilan-bekliyor:${d.__id}`,
+            deliveries: async () => [
+                { topic: 'staff', title: '📋 İlan onay bekliyor', body: clip(d.title, 100), notifType: 'ilan', actionTab: 'profil', uids: await adminUids(c.env) },
+            ],
+        };
+    },
+    'ilan-sonuc': async (c) => {
+        if (!(await c.staffRole()))
+            return null;
+        const d = await c.get(`plus_ilanlar/${clip(c.body.id, 80)}`);
+        if (!d || !d.ownerUid || (d.status !== 'approved' && d.status !== 'rejected'))
+            return null;
+        const ok = d.status === 'approved';
+        return {
+            dedupKey: `ilan-sonuc:${d.__id}:${d.status}`,
+            deliveries: async () => [
+                {
+                    topic: `u-${d.ownerUid}`,
+                    title: ok ? '✅ İlanınız yayında' : 'İlanınız onaylanmadı',
+                    body: ok ? `"${clip(d.title, 80)}" ilanı yayınlandı.` : `"${clip(d.title, 80)}" ilanı yönetim tarafından onaylanmadı.`,
+                    notifType: 'ilan',
+                    actionTab: 'profil',
+                    uids: [d.ownerUid],
+                },
+            ],
+        };
+    },
+    // Esnaf başvurusu
+    'esnaf-basvuru': async (c) => {
+        const d = await c.get(`plus_esnaf_basvurulari/${clip(c.body.id, 120)}`);
+        if (!d || d.ownerUid !== c.uid || d.status !== 'pending')
+            return null;
+        return {
+            dedupKey: `esnaf-basvuru:${d.__id}`,
+            deliveries: async () => [
+                { topic: 'staff', title: '🏪 Yeni esnaf başvurusu', body: `${clip(d.businessName, 80)} • ${clip(d.category, 40)} onay bekliyor.`, notifType: 'sistem', actionTab: 'profil', uids: await adminUids(c.env) },
+            ],
+        };
+    },
+    'esnaf-sonuc': async (c) => {
+        if (!(await c.staffRole()))
+            return null;
+        const d = await c.get(`plus_esnaf_basvurulari/${clip(c.body.id, 120)}`);
+        if (!d || !d.ownerUid || (d.status !== 'approved' && d.status !== 'rejected'))
+            return null;
+        const ok = d.status === 'approved';
+        return {
+            dedupKey: `esnaf-sonuc:${d.__id}:${d.status}`,
+            deliveries: async () => [
+                {
+                    topic: `u-${d.ownerUid}`,
+                    title: ok ? '🏪 İşletmeniz onaylandı' : 'İşletme başvurunuz onaylanmadı',
+                    body: ok ? `${clip(d.businessName, 80)} artık vitrinde herkese görünür.` : `${clip(d.businessName, 80)} başvurusu onaylanmadı.`,
+                    notifType: 'sistem',
+                    actionTab: 'profil',
+                    uids: [d.ownerUid],
+                },
+            ],
+        };
+    },
+    // Muhtarlık başvurusu
+    'muhtarlik-basvuru': async (c) => {
+        const d = await c.get(`plus_muhtarlik/${clip(c.body.id, 120)}`);
+        if (!d || d.ownerUid !== c.uid)
+            return null;
+        return {
+            dedupKey: `muhtarlik-basvuru:${d.__id}`,
+            deliveries: async () => [
+                { topic: 'staff', title: '🏛️ Yeni muhtarlık başvurusu', body: `${clip(d.category || d.subject || 'Başvuru', 80)} (${d.__id})`, notifType: 'muhtarlik', actionTab: 'profil', uids: await adminUids(c.env) },
+            ],
+        };
+    },
+    'muhtarlik-durum': async (c) => {
+        if (!(await c.staffRole()))
+            return null;
+        const d = await c.get(`plus_muhtarlik/${clip(c.body.id, 120)}`);
+        if (!d || !d.ownerUid || !d.status)
+            return null;
+        return {
+            dedupKey: `muhtarlik-durum:${d.__id}:${d.status}`,
+            deliveries: async () => [
+                { topic: `u-${d.ownerUid}`, title: '🏛️ Başvurunuz güncellendi', body: `${d.__id} numaralı başvurunuzun durumu: ${clip(d.status, 40)}.`, notifType: 'muhtarlik', actionTab: 'profil', uids: [d.ownerUid] },
+            ],
+        };
+    },
+    // Eleman ilanına başvuru → ilan sahibine
+    'is-basvuru': async (c) => {
+        const d = await c.get(`plus_is_basvurulari/${clip(c.body.id, 120)}`);
+        if (!d || d.applicantUid !== c.uid || !d.jobOwnerUid)
+            return null;
+        return {
+            dedupKey: `is-basvuru:${d.__id}`,
+            deliveries: async () => [
+                { topic: `u-${d.jobOwnerUid}`, title: '👷 İlanınıza yeni başvuru', body: 'Eleman ilanınıza bir başvuru geldi. Görmek için dokunun.', notifType: 'ilan', actionTab: 'profil', uids: [d.jobOwnerUid] },
+            ],
+        };
+    },
+    // Vefat ilanı
+    'vefat-bekliyor': async (c) => {
+        const d = await c.get(`plus_vefat/${clip(c.body.id, 80)}`);
+        if (!d || d.ownerUid !== c.uid || d.status !== 'pending')
+            return null;
+        return {
+            dedupKey: `vefat-bekliyor:${d.__id}`,
+            deliveries: async () => [
+                { topic: 'staff', title: '🕊️ Vefat ilanı onay bekliyor', body: clip(d.name, 80), notifType: 'vefat', actionTab: 'profil', uids: await adminUids(c.env) },
+            ],
+        };
+    },
+    'vefat-yayin': async (c) => {
+        if (!(await c.staffRole()))
+            return null;
+        const d = await c.get(`plus_vefat/${clip(c.body.id, 80)}`);
+        if (!d || d.status !== 'approved')
+            return null;
+        return {
+            dedupKey: `vefat-yayin:${d.__id}`,
+            deliveries: async () => [
+                { topic: 'tum', title: '🕊️ Vefat Duyurusu', body: `${clip(d.name, 80)} • ${clip(d.date, 60)} • ${clip(d.mosque, 60)}`, notifType: 'vefat', actionTab: 'anasayfa', broadcast: true },
+            ],
+        };
+    },
+    // Kesinti: yönetici onayladı → herkese
+    'kesinti-onay': async (c) => {
+        if (!(await c.staffRole()))
+            return null;
+        const d = await c.get(`plus_kesinti_onay/${clip(c.body.id, 80)}`);
+        if (!d || d.status !== 'bekliyor')
+            return null;
+        return {
+            dedupKey: `kesinti-onay:${d.__id}`,
+            deliveries: async () => [
+                {
+                    topic: 'tum',
+                    title: d.tip === 'Elektrik' ? '⚡ Elektrik Kesintisi' : '💧 Su Kesintisi',
+                    body: `${clip(d.mahalle, 80)} • ${clip(d.tarih, 30)} ${clip(d.saat, 30)}${d.aciklama ? ' — ' + clip(d.aciklama, 120) : ''}`,
+                    notifType: 'duyuru',
+                    actionTab: 'anasayfa',
+                    broadcast: true,
+                },
+            ],
+            after: async () => {
+                await fsCommit(c.env, [
+                    {
+                        update: { name: `${FS_ROOT}/plus_kesinti_onay/${d.__id}`, fields: fsFields({ status: 'onaylandi', onaylayanUid: c.uid, onayAtMs: Date.now() }) },
+                        updateMask: { fieldPaths: ['status', 'onaylayanUid', 'onayAtMs'] },
+                    },
+                ]);
+            },
+        };
+    },
+};
+// ---------------------------------------------------------------------------
+// Kesinti tarama: UEDAŞ / BUSKİ'de yeni kesinti çıkınca ÖNCE yöneticilere bildirim gider (onay bekler).
+// Yönetici onaylayınca (olay: kesinti-onay) tüm kullanıcılara gider.
+// ---------------------------------------------------------------------------
+async function scanKesinti(env, which) {
+    try {
+        const route = routes.find((r) => r.method === 'GET' && r.re.test(`/api/kesintiler/${which}`));
+        if (!route)
+            return { yeni: 0, hata: 'rota yok' };
+        const res = makeRes();
+        await route.h({ params: {}, query: {}, body: {} }, res);
+        const data = JSON.parse(res.body || '{}');
+        let items = [];
+        if (which === 'uedas')
+            items = Array.isArray(data.outages) ? data.outages : [];
+        else {
+            const flat = Array.isArray(data.items) ? data.items : [];
+            const nested = Object.values(data.neighborhoods || {}).flatMap((n) => (Array.isArray(n?.items) ? n.items : []));
+            const seen = new Set();
+            items = [...flat, ...nested].filter((x) => (x && !seen.has(x.id) ? (seen.add(x.id), true) : false));
+        }
+        let yeni = 0;
+        for (const it of items.slice(0, 20)) {
+            if (yeni >= 5)
+                break; // her taramada en fazla 5 yeni kayıt (alt istek sınırı)
+            const mahalle = which === 'uedas' ? it.mahalle : (it.neighborhoods || []).join(', ') || 'Mehmet Akif Mahallesi';
+            const key = which === 'uedas' ? `uedas|${it.tarih}|${it.saat}|${mahalle}|${clip(it.neden, 80)}` : `buski|${it.id}|${it.tarih}`;
+            const docId = `k-${await sha1Short(key)}`;
+            const fields = {
+                kaynak: which === 'uedas' ? 'UEDAŞ' : 'BUSKİ',
+                tip: which === 'uedas' ? 'Elektrik' : it.tip && String(it.tip).includes('Su') ? 'Su' : 'Su',
+                baslik: which === 'uedas' ? 'Planlı elektrik kesintisi' : clip(it.baslik, 120),
+                aciklama: which === 'uedas' ? clip(it.neden, 400) : clip(it.icerik, 400),
+                mahalle: clip(mahalle, 200),
+                tarih: clip(it.tarih, 60),
+                saat: clip(it.saat, 60),
+                status: 'bekliyor',
+                createdAtMs: Date.now(),
+            };
+            // Yalnızca ilk kez görülüyorsa oluştur (belge zaten varsa 409 döner → bildirim tekrarlanmaz)
+            const w = await fsCommit(env, [{ update: { name: `${FS_ROOT}/plus_kesinti_onay/${docId}`, fields: fsFields(fields) }, currentDocument: { exists: false } }]);
+            if (!w.ok)
+                continue;
+            yeni++;
+            await deliver(env, {
+                topic: 'staff',
+                title: `${fields.tip === 'Elektrik' ? '⚡' : '💧'} Yeni kesinti tespit edildi`,
+                body: `${fields.mahalle} • ${fields.tarih} ${fields.saat}. Yayınlamak için onayınız bekleniyor.`,
+                notifType: 'duyuru',
+                actionTab: 'profil',
+                subTab: 'bildirimler',
+                uids: await adminUids(env),
+            });
+        }
+        return { yeni };
+    }
+    catch (e) {
+        return { yeni: 0, hata: e?.message || 'bilinmiyor' };
+    }
+}
 async function handlePush(request, env, cors, path) {
     const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json; charset=utf-8', ...cors } });
     if (!env || !env.FCM_SERVICE_ACCOUNT)
@@ -288,35 +778,54 @@ async function handlePush(request, env, cors, path) {
     catch {
         body = {};
     }
+    const staffRole = async () => {
+        const adm = await fsGetAsUser(`admins/${user.uid}`, idToken);
+        if (!adm)
+            return null;
+        const role = adm.role || 'admin';
+        return STAFF_ROLES_ALL.includes(role) ? role : null;
+    };
     try {
-        // ---- Cihaz kaydı: FCM jetonunu "tum" konusuna abone et
+        // ---- Cihaz kaydı: jetonu rolüne uygun konulara abone et
         if (path === '/api/push/register') {
-            if (!pushRateOk('reg:' + user.uid, 30))
+            if (!pushRateOk('reg:' + user.uid, 40))
                 return json({ success: false, error: 'Çok fazla istek.' }, 429);
             const token = typeof body.token === 'string' ? body.token : '';
             if (token.length < 50 || token.length > 4096)
                 return json({ success: false, error: 'Geçersiz cihaz jetonu.' }, 400);
             const access = await getServiceAccountToken(env);
-            const res = await fetch('https://iid.googleapis.com/iid/v1:batchAdd', {
-                method: 'POST',
-                headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json', access_token_auth: 'true' },
-                body: JSON.stringify({ to: `/topics/${PUSH_TOPIC}`, registration_tokens: [token] }),
-            });
-            const out = await res.json().catch(() => ({}));
-            const err = out?.results?.[0]?.error || (!res.ok ? out?.error || 'HTTP ' + res.status : null);
-            if (err)
-                return json({ success: false, error: 'Abonelik başarısız: ' + String(err) }, 502);
+            const { topics } = await desiredTopics(user.uid, idToken);
+            const errors = [];
+            for (const t of topics) {
+                const err = await iidBatch(access, 'batchAdd', t, token);
+                if (err)
+                    errors.push(`${t}: ${err}`);
+            }
+            // Bırakılan hizmet alanları (yalnızca "usta-..." konuları) abonelikten çıkarılır
+            const removed = Array.isArray(body.removeFields) ? body.removeFields.slice(0, 12) : [];
+            for (const f of removed) {
+                const id = slugAlan(String(f));
+                if (id && !topics.includes(`usta-${id}`))
+                    await iidBatch(access, 'batchRemove', `usta-${id}`, token);
+            }
+            if (errors.length === topics.length)
+                return json({ success: false, error: 'Abonelik başarısız: ' + errors[0] }, 502);
+            return json({ success: true, topics: topics.length });
+        }
+        // ---- Çıkış: kişiye özel / yönetim / usta konularından çıkar ("tum" kalır)
+        if (path === '/api/push/unregister') {
+            const token = typeof body.token === 'string' ? body.token : '';
+            if (token.length < 50)
+                return json({ success: false, error: 'Geçersiz cihaz jetonu.' }, 400);
+            const access = await getServiceAccountToken(env);
+            const { managed } = await desiredTopics(user.uid, idToken);
+            for (const t of managed)
+                await iidBatch(access, 'batchRemove', t, token);
             return json({ success: true });
         }
-        // ---- Tüm cihazlara gönder (yalnızca yönetim)
+        // ---- Yönetim duyurusu: tüm cihazlara
         if (path === '/api/push/send') {
-            // Yönetici kontrolü: kullanıcının KENDİ kimliğiyle admins/{uid} belgesini okumayı dener (kurallar yalnızca kendi belgesine izin verir)
-            const docRes = await fetch(`https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/admins/${encodeURIComponent(user.uid)}`, { headers: { Authorization: `Bearer ${idToken}` } });
-            if (!docRes.ok)
-                return json({ success: false, error: 'Bu işlem için yetkiniz yok.' }, 403);
-            const adminDoc = await docRes.json().catch(() => ({}));
-            const role = adminDoc?.fields?.role?.stringValue || 'admin';
-            if (!PUSH_ADMIN_ROLES.includes(role))
+            if (!(await staffRole()) || !['admin', 'yonetici', 'editor'].includes((await staffRole())))
                 return json({ success: false, error: 'Bu işlem için yetkiniz yok.' }, 403);
             if (!pushRateOk('send:' + user.uid, 30))
                 return json({ success: false, error: 'Çok fazla bildirim gönderildi. Biraz sonra deneyin.' }, 429);
@@ -324,25 +833,56 @@ async function handlePush(request, env, cors, path) {
             const text = String(body.body || '').trim().slice(0, 300);
             if (!title || !text)
                 return json({ success: false, error: 'Başlık ve mesaj gerekli.' }, 400);
-            const actionTab = typeof body.actionTab === 'string' ? body.actionTab.slice(0, 30) : 'profil';
-            const access = await getServiceAccountToken(env);
-            const res = await fetch(`https://fcm.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/messages:send`, {
-                method: 'POST',
-                headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    message: {
-                        topic: PUSH_TOPIC,
-                        notification: { title, body: text },
-                        data: { type: 'duyuru', actionTab, subTab: 'bildirimler' },
-                        webpush: { headers: { Urgency: 'high', TTL: '86400' } },
-                        android: { priority: 'HIGH', ttl: '86400s' },
-                    },
-                }),
+            await sendTopic(env, {
+                topic: 'tum',
+                title,
+                body: text,
+                notifType: 'duyuru',
+                actionTab: typeof body.actionTab === 'string' ? body.actionTab.slice(0, 30) : 'profil',
             });
-            const out = await res.json().catch(() => ({}));
-            if (!res.ok)
-                return json({ success: false, error: 'Gönderilemedi: ' + (out?.error?.message || res.status) }, 502);
-            return json({ success: true, messageId: out?.name });
+            return json({ success: true });
+        }
+        // ---- Olay tabanlı bildirimler
+        if (path === '/api/push/event') {
+            const type = String(body.type || '');
+            const handler = EVENTS[type];
+            if (!handler)
+                return json({ success: false, error: 'Bilinmeyen olay.' }, 400);
+            if (!pushRateOk('evt:' + user.uid, 120))
+                return json({ success: false, error: 'Çok fazla istek.' }, 429);
+            const ctx = {
+                env,
+                uid: user.uid,
+                idToken,
+                body,
+                get: (p) => fsGetAsUser(p, idToken),
+                staffRole,
+            };
+            const ev = await handler(ctx);
+            if (!ev)
+                return json({ success: false, error: 'Olay doğrulanamadı.' }, 403);
+            // Aynı olay yalnızca bir kez işlenir
+            const logId = await sha1Short(ev.dedupKey);
+            const log = await fsCommit(env, [
+                { update: { name: `${FS_ROOT}/plus_push_log/${logId}`, fields: fsFields({ key: ev.dedupKey, atMs: Date.now() }) }, currentDocument: { exists: false } },
+            ]);
+            if (!log.ok)
+                return json({ success: true, skipped: true });
+            const deliveries = await ev.deliveries();
+            for (const d of deliveries)
+                await deliver(env, d);
+            if (ev.after)
+                await ev.after();
+            return json({ success: true, sent: deliveries.length });
+        }
+        // ---- Kesinti taramasını elle çalıştır (yalnızca yönetim)
+        if (path === '/api/push/kesinti-tara') {
+            if (!(await staffRole()))
+                return json({ success: false, error: 'Bu işlem için yetkiniz yok.' }, 403);
+            if (!pushRateOk('scan:' + user.uid, 10))
+                return json({ success: false, error: 'Çok sık tarama.' }, 429);
+            const [e, b] = [await scanKesinti(env, 'uedas'), await scanKesinti(env, 'buski')];
+            return json({ success: true, uedas: e, buski: b });
         }
     }
     catch (e) {
@@ -1633,6 +2173,16 @@ function corsHeaders(origin) {
     return h;
 }
 export default {
+    // Zamanlanmış görev: iki ayrı tetikleyici (UEDAŞ / BUSKİ) ayrı çalışır, böylece her biri kendi CPU süresiyle sınırlı kalır
+    async scheduled(controller, env, ctx) {
+        if (!env || !env.FCM_SERVICE_ACCOUNT)
+            return;
+        const which = controller.cron.startsWith('7,') ? 'buski' : 'uedas';
+        ctx.waitUntil(scanKesinti(env, which).then((r) => {
+            if (r.hata)
+                console.error('[kesinti-tara]', which, r.hata);
+        }));
+    },
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
         const origin = request.headers.get('Origin');
@@ -1652,7 +2202,7 @@ export default {
                 error: ok ? undefined : isPush ? 'Cloudflare\'de FCM_SERVICE_ACCOUNT secret\'ı eksik' : 'Cloudflare\'de CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET secret\'ları eksik',
             }), { headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...cors } });
         }
-        if ((url.pathname === '/api/push/register' || url.pathname === '/api/push/send') && request.method === 'POST') {
+        if (url.pathname.startsWith('/api/push/') && url.pathname !== '/api/push/status' && request.method === 'POST') {
             return handlePush(request, env, cors, url.pathname);
         }
         if (url.pathname === '/api/upload-signature' && request.method === 'POST') {
