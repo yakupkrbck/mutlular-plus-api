@@ -686,6 +686,41 @@ const EVENTS = {
             ],
         };
     },
+    // Vatandaş haber ihbarı
+    'haber-ihbar': async (c) => {
+        const d = await c.get(`plus_haber_ihbar/${clip(c.body.id, 120)}`);
+        if (!d || d.ownerUid !== c.uid || d.status !== 'pending')
+            return null;
+        return {
+            dedupKey: `haber-ihbar:${d.__id}`,
+            deliveries: async () => [
+                { topic: 'staff', title: '📰 Yeni haber ihbarı', body: `${clip(d.title, 90)} onay bekliyor.`, notifType: 'sistem', actionTab: 'profil', uids: await adminUids(c.env) },
+            ],
+        };
+    },
+    'haber-ihbar-sonuc': async (c) => {
+        if (!(await c.staffRole()))
+            return null;
+        const d = await c.get(`plus_haber_ihbar/${clip(c.body.id, 120)}`);
+        if (!d || !d.ownerUid || (d.status !== 'approved' && d.status !== 'rejected'))
+            return null;
+        const ok = d.status === 'approved';
+        const toNews = ok && d.newsId;
+        return {
+            dedupKey: `haber-ihbar-sonuc:${d.__id}:${d.status}`,
+            deliveries: async () => [
+                {
+                    topic: `u-${d.ownerUid}`,
+                    title: ok ? '📰 İhbarınız habere dönüştü' : 'Haber ihbarınız yayınlanmadı',
+                    body: ok ? `${clip(d.title, 90)} haber olarak yayınlandı.` : `${clip(d.title, 90)} yayınlanmadı.`,
+                    notifType: 'sistem',
+                    actionTab: toNews ? 'haber' : 'profil',
+                    relatedId: toNews ? clip(d.newsId, 120) : undefined,
+                    uids: [d.ownerUid],
+                },
+            ],
+        };
+    },
     // Muhtarlık başvurusu
     'muhtarlik-basvuru': async (c) => {
         const d = await c.get(`plus_muhtarlik/${clip(c.body.id, 120)}`);
@@ -2303,6 +2338,9 @@ export default {
         }
         if (url.pathname === '/api/upload-signature' && request.method === 'POST') {
             return handleUploadSignature(request, env, cors);
+        }
+        if (url.pathname === '/api/version') {
+            return new Response(JSON.stringify({ ok: true, build: '2026-11-05-haber-ihbar', features: ['relatedId', 'kesinti-subTab', 'video-upload', 'haber-ihbar'] }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...cors } });
         }
         if (url.pathname === '/test') {
             return new Response(TEST_PAGE, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
