@@ -118,6 +118,8 @@ const FIREBASE_PROJECT_ID = 'mutlular-haber';
 const CLOUDINARY_CLOUD_NAME = 'dn2wanvcr';
 const UPLOAD_FOLDER = 'mutlular';
 const ALLOWED_FORMATS = 'jpg,jpeg,png,webp';
+const VIDEO_FOLDER = 'mutlular/video';
+const VIDEO_FORMATS = 'mp4,mov,webm,m4v';
 const JWKS_URL = 'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com';
 let jwksCache = null;
 const signCounters = new Map();
@@ -189,24 +191,36 @@ async function handleUploadSignature(request, env, cors) {
     const user = token ? await verifyFirebaseToken(token) : null;
     if (!user)
         return json({ success: false, error: 'Giriş gerekli.' }, 401);
-    // Basit hız sınırı: kullanıcı başına saatte 60 imza (isolate başına)
+    // Video yalnızca yetkili kadro (yönetici / editör / muhtar) tarafından yüklenebilir
+    const isVideo = new URL(request.url).searchParams.get('type') === 'video';
+    if (isVideo) {
+        const adm = await fsGetAsUser(`admins/${user.uid}`, token);
+        const role = adm ? adm.role || 'admin' : null;
+        if (!role || !STAFF_ROLES_ALL.includes(role))
+            return json({ success: false, error: 'Video yüklemek için yetkiniz yok.' }, 403);
+    }
+    // Basit hız sınırı: kullanıcı başına saatte 60 fotoğraf / 15 video imzası (isolate başına)
     const now = Date.now();
-    const c = signCounters.get(user.uid);
+    const counterKey = (isVideo ? 'v:' : 'i:') + user.uid;
+    const limit = isVideo ? 15 : 60;
+    const c = signCounters.get(counterKey);
     if (!c || c.reset < now)
-        signCounters.set(user.uid, { n: 1, reset: now + 3600_000 });
-    else if (++c.n > 60)
+        signCounters.set(counterKey, { n: 1, reset: now + 3600_000 });
+    else if (++c.n > limit)
         return json({ success: false, error: 'Çok fazla yükleme. Biraz sonra deneyin.' }, 429);
     const timestamp = Math.floor(now / 1000);
+    const folder = isVideo ? VIDEO_FOLDER : UPLOAD_FOLDER;
+    const formats = isVideo ? VIDEO_FORMATS : ALLOWED_FORMATS;
     // Cloudinary imza kuralı: parametreler alfabetik sıralı "k=v&k=v" + api_secret → SHA-1
-    const toSign = `allowed_formats=${ALLOWED_FORMATS}&folder=${UPLOAD_FOLDER}&timestamp=${timestamp}`;
+    const toSign = `allowed_formats=${formats}&folder=${folder}&timestamp=${timestamp}`;
     const signature = await sha1Hex(toSign + env.CLOUDINARY_API_SECRET);
     return json({
         success: true,
         cloudName: CLOUDINARY_CLOUD_NAME,
         apiKey: env.CLOUDINARY_API_KEY,
         timestamp,
-        folder: UPLOAD_FOLDER,
-        allowedFormats: ALLOWED_FORMATS,
+        folder,
+        allowedFormats: formats,
         signature,
     });
 }
