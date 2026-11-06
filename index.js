@@ -171,7 +171,7 @@ async function verifyFirebaseToken(token) {
             return null;
         if (!payload.sub || typeof payload.sub !== 'string')
             return null;
-        return { uid: payload.sub };
+        return { uid: payload.sub, authTime: typeof payload.auth_time === 'number' ? payload.auth_time : 0 };
     }
     catch {
         return null;
@@ -180,6 +180,118 @@ async function verifyFirebaseToken(token) {
 async function sha1Hex(text) {
     const buf = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(text));
     return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+// ---------------------------------------------------------------------------
+// Hesap silme (Google Play zorunluluğu): kişinin tüm verisini ve Firebase hesabını kalıcı olarak siler.
+// Güvenlik: son 10 dakika içinde yeniden doğrulama şart; yönetici/editör hesapları uygulamadan silinemez.
+// ---------------------------------------------------------------------------
+const deleteCounters = new Map();
+const OWNED_COLLECTIONS = [
+    ['plus_ilanlar', 'ownerUid'],
+    ['plus_isler', 'ownerUid'],
+    ['plus_is_basvurulari', 'applicantUid'],
+    ['plus_isletmeler', 'ownerUid'],
+    ['plus_hikayeler', 'ownerUid'],
+    ['plus_talepler', 'ownerUid'],
+    ['plus_vefat', 'ownerUid'],
+    ['plus_esnaf_basvurulari', 'ownerUid'],
+    ['plus_muhtarlik', 'ownerUid'],
+    ['plus_haber_ihbar', 'ownerUid'],
+];
+async function deleteDocs(env, names) {
+    for (let i = 0; i < names.length; i += 400) {
+        const w = await fsCommit(env, names.slice(i, i + 400).map((n) => ({ delete: n })));
+        if (!w.ok)
+            throw new Error('Firestore silme hatası ' + w.status + ' ' + (w.error || ''));
+    }
+}
+async function handleAccountDelete(request, env, cors) {
+    const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...cors } });
+    const auth = request.headers.get('Authorization') || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    const user = token ? await verifyFirebaseToken(token) : null;
+    if (!user)
+        return json({ success: false, error: 'Giriş gerekli.' }, 401);
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (!user.authTime || nowSec - user.authTime > 600)
+        return json({ success: false, error: 'reauth_required' }, 401);
+    const now = Date.now();
+    const c = deleteCounters.get(user.uid);
+    if (!c || c.reset < now)
+        deleteCounters.set(user.uid, { n: 1, reset: now + 3600_000 });
+    else if (++c.n > 5)
+        return json({ success: false, error: 'Çok fazla deneme. Biraz sonra tekrar deneyin.' }, 429);
+    try {
+        const adm = await fsGetAsUser(`admins/${user.uid}`, token);
+        if (adm)
+            return json({ success: false, error: 'Yönetici / editör hesapları uygulamadan silinemez. Lütfen yönetimle iletişime geçin.' }, 403);
+        const uid = user.uid;
+        const deleted = {};
+        // 1) Kişinin oluşturduğu kayıtlar
+        for (const [col, field] of OWNED_COLLECTIONS) {
+            let total = 0;
+            for (let pass = 0; pass < 5; pass++) {
+                const rows = await fsRunQuery(env, {
+                    from: [{ collectionId: col }],
+                    where: { fieldFilter: { field: { fieldPath: field }, op: 'EQUAL', value: { stringValue: uid } } },
+                    limit: 400,
+                });
+                if (!rows.length)
+                    break;
+                await deleteDocs(env, rows.map((r) => `${FS_ROOT}/${col}/${r.__id}`));
+                total += rows.length;
+                if (rows.length < 400)
+                    break;
+            }
+            deleted[col] = total;
+        }
+        // 2) Usta ise hizmet alanı listelerinden çıkar
+        const fields = await fsRunQuery(env, {
+            from: [{ collectionId: 'plus_hizmet_alanlari' }],
+            where: { fieldFilter: { field: { fieldPath: 'ustalar' }, op: 'ARRAY_CONTAINS', value: { stringValue: uid } } },
+            limit: 200,
+        });
+        if (fields.length) {
+            const w = await fsCommit(env, fields.map((r) => ({
+                transform: {
+                    document: `${FS_ROOT}/plus_hizmet_alanlari/${r.__id}`,
+                    fieldTransforms: [{ fieldPath: 'ustalar', removeAllFromArray: { values: [{ stringValue: uid }] } }],
+                },
+            })));
+            if (!w.ok)
+                throw new Error('Firestore güncelleme hatası ' + w.status);
+        }
+        deleted.plus_hizmet_alanlari = fields.length;
+        // 3) Kişisel bildirimler (alt koleksiyon) ve profil belgesi
+        const access = await getServiceAccountToken(env);
+        let notif = 0;
+        for (let pass = 0; pass < 10; pass++) {
+            const res = await fetch(`${FS_BASE}/plus_users/${encodeURIComponent(uid)}/bildirimler?pageSize=300`, { headers: { Authorization: `Bearer ${access}` } });
+            if (!res.ok)
+                break;
+            const data = await res.json();
+            const names = (data.documents || []).map((d) => d.name);
+            if (!names.length)
+                break;
+            await deleteDocs(env, names);
+            notif += names.length;
+        }
+        deleted.bildirimler = notif;
+        await deleteDocs(env, [`${FS_ROOT}/plus_users/${uid}`]);
+        // 4) Firebase Authentication hesabı
+        const del = await fetch(`https://identitytoolkit.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/accounts:delete`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ localId: uid }),
+        });
+        if (!del.ok && del.status !== 400)
+            return json({ success: false, error: 'Hesap silinemedi, lütfen tekrar deneyin.' }, 502);
+        return json({ success: true, deleted });
+    }
+    catch (e) {
+        console.error('[hesap-sil]', e?.message || e);
+        return json({ success: false, error: 'Hesap silinirken bir sorun oluştu. Lütfen tekrar deneyin.' }, 500);
+    }
 }
 async function handleUploadSignature(request, env, cors) {
     const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json; charset=utf-8', ...cors } });
@@ -2336,11 +2448,14 @@ export default {
         if (url.pathname.startsWith('/api/push/') && url.pathname !== '/api/push/status' && request.method === 'POST') {
             return handlePush(request, env, cors, url.pathname);
         }
+        if (url.pathname === '/api/account/delete' && request.method === 'POST') {
+            return handleAccountDelete(request, env, cors);
+        }
         if (url.pathname === '/api/upload-signature' && request.method === 'POST') {
             return handleUploadSignature(request, env, cors);
         }
         if (url.pathname === '/api/version') {
-            return new Response(JSON.stringify({ ok: true, build: '2026-11-05-haber-ihbar', features: ['relatedId', 'kesinti-subTab', 'video-upload', 'haber-ihbar'] }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...cors } });
+            return new Response(JSON.stringify({ ok: true, build: '2026-11-06-android', features: ['relatedId', 'kesinti-subTab', 'video-upload', 'haber-ihbar', 'account-delete'] }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...cors } });
         }
         if (url.pathname === '/test') {
             return new Response(TEST_PAGE, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
