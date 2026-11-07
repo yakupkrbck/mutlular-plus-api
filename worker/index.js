@@ -185,6 +185,68 @@ async function sha1Hex(text) {
 // Hesap silme (Google Play zorunluluğu): kişinin tüm verisini ve Firebase hesabını kalıcı olarak siler.
 // Güvenlik: son 10 dakika içinde yeniden doğrulama şart; yönetici/editör hesapları uygulamadan silinemez.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Mahalle anketi: oy verme. Sunucu tarafında tek atomik işlemle (oy kaydı + sayaçlar) yazılır:
+// bir kişi bir ankete yalnızca bir kez oy verebilir, sayaçlar istemciden değiştirilemez.
+// ---------------------------------------------------------------------------
+const voteCounters = new Map();
+async function handlePollVote(request, env, cors) {
+    const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...cors } });
+    const auth = request.headers.get('Authorization') || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    const user = token ? await verifyFirebaseToken(token) : null;
+    if (!user)
+        return json({ success: false, error: 'Oy vermek için giriş yapmalısınız.' }, 401);
+    const body = await request.json().catch(() => null);
+    const pollId = typeof body?.pollId === 'string' ? body.pollId.slice(0, 120) : '';
+    const ids = Array.isArray(body?.optionIds)
+        ? [...new Set(body.optionIds.filter((x) => typeof x === 'string').map((x) => x.slice(0, 12)))]
+        : [];
+    if (!/^[A-Za-z0-9_-]+$/.test(pollId) || !ids.length)
+        return json({ success: false, error: 'Geçersiz istek.' }, 400);
+    const now = Date.now();
+    const c = voteCounters.get(user.uid);
+    if (!c || c.reset < now)
+        voteCounters.set(user.uid, { n: 1, reset: now + 3600_000 });
+    else if (++c.n > 40)
+        return json({ success: false, error: 'Çok fazla deneme. Biraz sonra tekrar deneyin.' }, 429);
+    try {
+        const poll = await fsGetAsUser(`plus_anketler/${pollId}`, token);
+        if (!poll)
+            return json({ success: false, error: 'Anket bulunamadı.' }, 404);
+        if (poll.status !== 'active' || (poll.endsAtMs && Number(poll.endsAtMs) <= now))
+            return json({ success: false, error: 'Bu anket sona erdi.' }, 409);
+        const valid = (Array.isArray(poll.optionIds) ? poll.optionIds : []).filter((x) => typeof x === 'string' && /^[A-Za-z0-9_]+$/.test(x));
+        const max = poll.allowMultiple ? Math.max(1, Math.min(Number(poll.maxChoices) || valid.length, valid.length)) : 1;
+        if (ids.length > max || ids.some((i) => !valid.includes(i)))
+            return json({ success: false, error: 'Geçersiz seçim.' }, 400);
+        const pollName = `${FS_ROOT}/plus_anketler/${pollId}`;
+        const voteName = `${FS_ROOT}/plus_anket_oylar/${pollId}__${user.uid}`;
+        const w = await fsCommit(env, [
+            // Aynı kişi ikinci kez oy veremez: belge zaten varsa tüm işlem reddedilir
+            { update: { name: voteName, fields: fsFields({ uid: user.uid, pollId, optionIds: ids, createdAtMs: now }) }, currentDocument: { exists: false } },
+            {
+                transform: {
+                    document: pollName,
+                    fieldTransforms: [
+                        ...ids.map((i) => ({ fieldPath: `counts.${i}`, increment: { integerValue: '1' } })),
+                        { fieldPath: 'totalVotes', increment: { integerValue: '1' } },
+                    ],
+                },
+            },
+        ]);
+        if (!w.ok) {
+            if (fsIsDuplicate(w))
+                return json({ success: false, error: 'Bu ankete zaten oy kullandınız.' }, 409);
+            throw new Error('Firestore yazma hatası ' + w.status + ' ' + (w.error || ''));
+        }
+        return json({ success: true });
+    }
+    catch (e) {
+        console.error('[anket-oy]', e?.message || e);
+        return json({ success: false, error: 'Oy kaydedilemedi, lütfen tekrar deneyin.' }, 500);
+    }
+}
 const deleteCounters = new Map();
 const OWNED_COLLECTIONS = [
     ['plus_ilanlar', 'ownerUid'],
@@ -197,6 +259,7 @@ const OWNED_COLLECTIONS = [
     ['plus_esnaf_basvurulari', 'ownerUid'],
     ['plus_muhtarlik', 'ownerUid'],
     ['plus_haber_ihbar', 'ownerUid'],
+    ['plus_anket_oylar', 'uid'],
 ];
 async function deleteDocs(env, names) {
     for (let i = 0; i < names.length; i += 400) {
@@ -2448,6 +2511,9 @@ export default {
         if (url.pathname.startsWith('/api/push/') && url.pathname !== '/api/push/status' && request.method === 'POST') {
             return handlePush(request, env, cors, url.pathname);
         }
+        if (url.pathname === '/api/poll/vote' && request.method === 'POST') {
+            return handlePollVote(request, env, cors);
+        }
         if (url.pathname === '/api/account/delete' && request.method === 'POST') {
             return handleAccountDelete(request, env, cors);
         }
@@ -2455,7 +2521,7 @@ export default {
             return handleUploadSignature(request, env, cors);
         }
         if (url.pathname === '/api/version') {
-            return new Response(JSON.stringify({ ok: true, build: '2026-11-06-android', features: ['relatedId', 'kesinti-subTab', 'video-upload', 'haber-ihbar', 'account-delete'] }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...cors } });
+            return new Response(JSON.stringify({ ok: true, build: '2026-11-06-anket', features: ['relatedId', 'kesinti-subTab', 'video-upload', 'haber-ihbar', 'account-delete', 'anket'] }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...cors } });
         }
         if (url.pathname === '/test') {
             return new Response(TEST_PAGE, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
