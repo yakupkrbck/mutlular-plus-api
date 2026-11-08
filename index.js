@@ -189,6 +189,123 @@ async function sha1Hex(text) {
 // Mahalle anketi: oy verme. Sunucu tarafında tek atomik işlemle (oy kaydı + sayaçlar) yazılır:
 // bir kişi bir ankete yalnızca bir kez oy verebilir, sayaçlar istemciden değiştirilemez.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// YouTube canlı yayın algılama (vitrinde canlı yayın göstermek için)
+// Ayarlar: Firestore `plus_ayarlar/canli` { kanal, sabitVideo } • Gizli anahtar: YOUTUBE_API_KEY (Worker secret)
+// Kota: 2 istek/kontrol (playlistItems + videos = 2 birim); sonuç 60 sn önbelleğe alınır, kullanıcı sayısından bağımsız.
+// ---------------------------------------------------------------------------
+const YT_API = 'https://www.googleapis.com/youtube/v3';
+const ytChannelCache = new Map();
+async function fsGetService(env, path) {
+    const access = await getServiceAccountToken(env);
+    const res = await fetch(`${FS_BASE}/${path}`, { headers: { Authorization: `Bearer ${access}` } });
+    if (res.status === 404)
+        return null;
+    if (!res.ok)
+        throw new Error('Firestore okuma hatası ' + res.status);
+    const doc = await res.json();
+    return fsDecodeFields(doc.fields || {});
+}
+function ytVideoIdFrom(input) {
+    const t = String(input || '').trim();
+    if (/^[A-Za-z0-9_-]{11}$/.test(t))
+        return t;
+    const m = t.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:[^#]*&)?v=|embed\/|shorts\/|live\/))([A-Za-z0-9_-]{11})/);
+    return m ? m[1] : '';
+}
+async function resolveYtChannelId(kanal, key) {
+    const k = String(kanal || '').trim();
+    const direct = k.match(/(UC[A-Za-z0-9_-]{22})/);
+    if (direct)
+        return direct[1];
+    const h = k.match(/@([A-Za-z0-9._-]+)/);
+    if (!h)
+        return null;
+    const cached = ytChannelCache.get(h[1]);
+    if (cached && cached.exp > Date.now())
+        return cached.id;
+    const r = await fetch(`${YT_API}/channels?part=id&forHandle=${encodeURIComponent('@' + h[1])}&key=${key}`);
+    if (!r.ok)
+        throw new Error('YouTube kanal sorgusu ' + r.status);
+    const j = await r.json();
+    const id = j.items?.[0]?.id || null;
+    if (id)
+        ytChannelCache.set(h[1], { id, exp: Date.now() + 86400_000 });
+    return id;
+}
+async function checkYoutubeLive(env) {
+    const key = env.YOUTUBE_API_KEY;
+    if (!key)
+        return { configured: false, reason: 'no_api_key', live: false };
+    const ayar = (await fsGetService(env, 'plus_ayarlar/canli')) || {};
+    const sabit = ytVideoIdFrom(ayar.sabitVideo);
+    const channelId = ayar.kanal ? await resolveYtChannelId(ayar.kanal, key) : null;
+    if (!sabit && !channelId)
+        return { configured: false, reason: 'no_channel', live: false };
+    const ids = [];
+    if (sabit)
+        ids.push(sabit);
+    if (channelId) {
+        // Kanalın "yüklenenler" listesi: UC… → UU…
+        const pl = await fetch(`${YT_API}/playlistItems?part=contentDetails&playlistId=UU${channelId.slice(2)}&maxResults=8&key=${key}`);
+        if (pl.ok) {
+            const pj = await pl.json();
+            for (const it of pj.items || []) {
+                const id = it?.contentDetails?.videoId;
+                if (id && !ids.includes(id))
+                    ids.push(id);
+            }
+        }
+    }
+    if (!ids.length)
+        return { configured: true, live: false };
+    const vr = await fetch(`${YT_API}/videos?part=snippet,liveStreamingDetails&id=${ids.join(',')}&key=${key}`);
+    if (!vr.ok)
+        throw new Error('YouTube video sorgusu ' + vr.status);
+    const vj = await vr.json();
+    const items = vj.items || [];
+    const startOf = (v) => Date.parse(v.liveStreamingDetails?.actualStartTime || '') || 0;
+    const lives = items.filter((v) => v.snippet?.liveBroadcastContent === 'live');
+    lives.sort((a, b) => (a.id === sabit ? -1 : 0) - (b.id === sabit ? -1 : 0) || startOf(b) - startOf(a));
+    const v = lives[0];
+    if (v) {
+        return {
+            configured: true,
+            live: true,
+            videoId: v.id,
+            title: String(v.snippet?.title || '').slice(0, 140),
+            viewers: v.liveStreamingDetails?.concurrentViewers ? Number(v.liveStreamingDetails.concurrentViewers) : undefined,
+            startedAt: startOf(v) || undefined,
+        };
+    }
+    const up = items.find((x) => x.snippet?.liveBroadcastContent === 'upcoming');
+    return { configured: true, live: false, upcoming: up ? { videoId: up.id, title: String(up.snippet?.title || '').slice(0, 140) } : undefined };
+}
+async function handleLiveStatus(request, env, cors) {
+    const headers = (ttl) => ({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': `public, max-age=${ttl}`, ...cors });
+    const cache = typeof caches !== 'undefined' ? caches.default : null;
+    const cacheKey = new Request('https://live-status.internal/v1');
+    if (cache) {
+        const hit = await cache.match(cacheKey);
+        if (hit)
+            return new Response(await hit.text(), { status: 200, headers: headers(30) });
+    }
+    let out;
+    let ttl = 60;
+    try {
+        out = await checkYoutubeLive(env);
+    }
+    catch (e) {
+        console.error('[canli]', e?.message || e);
+        out = { configured: true, live: false, error: 'youtube' };
+        ttl = 20;
+    }
+    out.checkedAt = Date.now();
+    const body = JSON.stringify(out);
+    if (cache)
+        await cache.put(cacheKey, new Response(body, { headers: { 'Content-Type': 'application/json', 'Cache-Control': `public, max-age=${ttl}` } }));
+    return new Response(body, { status: 200, headers: headers(Math.min(ttl, 30)) });
+}
 const voteCounters = new Map();
 async function handlePollVote(request, env, cors) {
     const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...cors } });
@@ -2511,6 +2628,9 @@ export default {
         if (url.pathname.startsWith('/api/push/') && url.pathname !== '/api/push/status' && request.method === 'POST') {
             return handlePush(request, env, cors, url.pathname);
         }
+        if (url.pathname === '/api/live' && request.method === 'GET') {
+            return handleLiveStatus(request, env, cors);
+        }
         if (url.pathname === '/api/poll/vote' && request.method === 'POST') {
             return handlePollVote(request, env, cors);
         }
@@ -2521,7 +2641,7 @@ export default {
             return handleUploadSignature(request, env, cors);
         }
         if (url.pathname === '/api/version') {
-            return new Response(JSON.stringify({ ok: true, build: '2026-11-06-anket', features: ['relatedId', 'kesinti-subTab', 'video-upload', 'haber-ihbar', 'account-delete', 'anket'] }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...cors } });
+            return new Response(JSON.stringify({ ok: true, build: '2026-11-07-canli', features: ['relatedId', 'kesinti-subTab', 'video-upload', 'haber-ihbar', 'account-delete', 'anket', 'canli-yayin'] }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...cors } });
         }
         if (url.pathname === '/test') {
             return new Response(TEST_PAGE, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
