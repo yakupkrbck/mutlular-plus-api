@@ -306,6 +306,109 @@ async function handleLiveStatus(request, env, cors) {
         await cache.put(cacheKey, new Response(body, { headers: { 'Content-Type': 'application/json', 'Cache-Control': `public, max-age=${ttl}` } }));
     return new Response(body, { status: 200, headers: headers(Math.min(ttl, 30)) });
 }
+// ---------------------------------------------------------------------------
+// Editör atama / geri alma / listeleme (yalnızca yönetici).
+// Yetki Firestore'daki `admins/{uid}` kaydından gelir; bu kayda istemci yazamaz, yalnızca bu uç noktalar yazar.
+// ---------------------------------------------------------------------------
+const staffCounters = new Map();
+// authService.readStaffRole ile aynı kural: editor / muhtar dışındaki her kayıt tam yönetici sayılır
+const isFullAdminRole = (r) => r !== 'editor' && r !== 'muhtar';
+async function handleStaff(request, env, cors, action) {
+    const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...cors } });
+    const auth = request.headers.get('Authorization') || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    const user = token ? await verifyFirebaseToken(token) : null;
+    if (!user)
+        return json({ success: false, error: 'Giriş gerekli.' }, 401);
+    try {
+        const caller = await fsGetAsUser(`admins/${user.uid}`, token);
+        if (!caller || !isFullAdminRole(caller.role))
+            return json({ success: false, error: 'Bu işlem için yönetici yetkisi gerekir.' }, 403);
+        const now = Date.now();
+        const c = staffCounters.get(user.uid);
+        if (!c || c.reset < now)
+            staffCounters.set(user.uid, { n: 1, reset: now + 3600_000 });
+        else if (++c.n > 60)
+            return json({ success: false, error: 'Çok fazla işlem. Biraz sonra tekrar deneyin.' }, 429);
+        const body = await request.json().catch(() => ({}));
+        if (action === 'list') {
+            const rows = await fsRunQuery(env, {
+                from: [{ collectionId: 'admins' }],
+                where: { fieldFilter: { field: { fieldPath: 'role' }, op: 'EQUAL', value: { stringValue: 'editor' } } },
+                limit: 200,
+            });
+            const editors = rows
+                .map((r) => ({
+                uid: r.__id,
+                name: String(r.name || ''),
+                email: String(r.email || ''),
+                phone: String(r.phone || ''),
+                duties: Array.isArray(r.duties) ? r.duties.map(String) : [],
+                assignedAtMs: Number(r.assignedAtMs) || 0,
+                assignedByName: String(r.assignedByName || ''),
+            }))
+                .sort((a, b) => b.assignedAtMs - a.assignedAtMs);
+            return json({ success: true, editors });
+        }
+        if (action === 'assign') {
+            const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 160)
+                return json({ success: false, error: 'Geçerli bir e-posta adresi girin.' }, 400);
+            const access = await getServiceAccountToken(env);
+            const look = await fetch(`https://identitytoolkit.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/accounts:lookup`, {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email: [email] }),
+            });
+            if (!look.ok)
+                throw new Error('Kullanıcı sorgusu ' + look.status);
+            const found = (await look.json()).users?.[0];
+            const targetUid = found?.localId;
+            if (!targetUid)
+                return json({ success: false, error: 'Bu e-posta ile kayıtlı kullanıcı bulunamadı. Kişi önce uygulamaya kayıt olmalı.' }, 404);
+            const profile = await fsGetService(env, `plus_users/${targetUid}`);
+            if (!profile)
+                return json({ success: false, error: 'Bu kişinin uygulamada profili yok. Önce uygulamaya girip kayıt olmalı.' }, 404);
+            const existing = await fsGetService(env, `admins/${targetUid}`);
+            if (existing && existing.role !== 'editor')
+                return json({ success: false, error: 'Bu kişi zaten yönetici veya muhtar; rolü değiştirilemez.' }, 409);
+            const duties = Array.isArray(body.duties) ? body.duties.filter((d) => typeof d === 'string').slice(0, 8).map((d) => d.slice(0, 60)) : [];
+            const record = {
+                role: 'editor',
+                name: String(body.name || profile.name || '').trim().slice(0, 80),
+                email,
+                phone: String(body.phone || profile.phone || '').trim().slice(0, 30),
+                duties,
+                assignedBy: user.uid,
+                assignedByName: String(caller.name || 'Yönetici').slice(0, 60),
+                assignedAtMs: now,
+            };
+            const w = await fsCommit(env, [{ update: { name: `${FS_ROOT}/admins/${targetUid}`, fields: fsFields(record) } }]);
+            if (!w.ok)
+                throw new Error('Firestore yazma hatası ' + w.status);
+            return json({ success: true, editor: { uid: targetUid, ...record } });
+        }
+        if (action === 'revoke') {
+            const uid = typeof body.uid === 'string' ? body.uid : '';
+            if (!/^[A-Za-z0-9]{6,128}$/.test(uid))
+                return json({ success: false, error: 'Geçersiz kullanıcı.' }, 400);
+            if (uid === user.uid)
+                return json({ success: false, error: 'Kendi yetkinizi buradan kaldıramazsınız.' }, 400);
+            const target = await fsGetService(env, `admins/${uid}`);
+            if (!target || target.role !== 'editor')
+                return json({ success: false, error: 'Yalnızca editör yetkisi geri alınabilir.' }, 403);
+            const w = await fsCommit(env, [{ delete: `${FS_ROOT}/admins/${uid}` }]);
+            if (!w.ok)
+                throw new Error('Firestore silme hatası ' + w.status);
+            return json({ success: true });
+        }
+        return json({ success: false, error: 'Bilinmeyen işlem.' }, 400);
+    }
+    catch (e) {
+        console.error('[personel]', e?.message || e);
+        return json({ success: false, error: 'İşlem yapılamadı, lütfen tekrar deneyin.' }, 500);
+    }
+}
 const voteCounters = new Map();
 async function handlePollVote(request, env, cors) {
     const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...cors } });
@@ -2628,6 +2731,10 @@ export default {
         if (url.pathname.startsWith('/api/push/') && url.pathname !== '/api/push/status' && request.method === 'POST') {
             return handlePush(request, env, cors, url.pathname);
         }
+        if (url.pathname.startsWith('/api/staff/') && request.method === 'POST') {
+            const action = url.pathname.slice('/api/staff/'.length);
+            return handleStaff(request, env, cors, action);
+        }
         if (url.pathname === '/api/live' && request.method === 'GET') {
             return handleLiveStatus(request, env, cors);
         }
@@ -2641,7 +2748,7 @@ export default {
             return handleUploadSignature(request, env, cors);
         }
         if (url.pathname === '/api/version') {
-            return new Response(JSON.stringify({ ok: true, build: '2026-11-07-canli', features: ['relatedId', 'kesinti-subTab', 'video-upload', 'haber-ihbar', 'account-delete', 'anket', 'canli-yayin'] }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...cors } });
+            return new Response(JSON.stringify({ ok: true, build: '2026-11-08-editor', features: ['relatedId', 'kesinti-subTab', 'video-upload', 'haber-ihbar', 'account-delete', 'anket', 'canli-yayin', 'editor-atama'] }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...cors } });
         }
         if (url.pathname === '/test') {
             return new Response(TEST_PAGE, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
