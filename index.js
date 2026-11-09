@@ -190,6 +190,59 @@ async function sha1Hex(text) {
 // bir kişi bir ankete yalnızca bir kez oy verebilir, sayaçlar istemciden değiştirilemez.
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
+// Kısa süreli önbellek: önce belleğe (isolate içinde; her adreste çalışır), sonra Cache API'ye bakar.
+// Cloudflare Cache API *.workers.dev adreslerinde çalışmaz; bellek katmanı sayesinde önbellek,
+// yinelenen okuma koruması ve YouTube kota koruması workers.dev üzerinde de işler.
+// ---------------------------------------------------------------------------
+const memCache = new Map();
+function memGet(key) {
+    const e = memCache.get(key);
+    if (!e)
+        return undefined;
+    if (e.exp < Date.now()) {
+        memCache.delete(key);
+        return undefined;
+    }
+    return e.value;
+}
+function memSet(key, value, ttlMs) {
+    if (memCache.size > 5000) {
+        const now = Date.now();
+        for (const [k, v] of memCache)
+            if (v.exp < now)
+                memCache.delete(k);
+        if (memCache.size > 5000)
+            memCache.clear();
+    }
+    memCache.set(key, { exp: Date.now() + ttlMs, value });
+}
+async function cacheGetText(key) {
+    const m = memGet(key);
+    if (m !== undefined)
+        return m;
+    if (typeof caches === 'undefined')
+        return undefined;
+    try {
+        const hit = await caches.default.match(new Request('https://cache.internal/' + encodeURIComponent(key)));
+        if (hit) {
+            const t = await hit.text();
+            memSet(key, t, 30_000);
+            return t;
+        }
+    }
+    catch { }
+    return undefined;
+}
+async function cachePutText(key, text, ttlSec) {
+    memSet(key, text, ttlSec * 1000);
+    if (typeof caches === 'undefined')
+        return;
+    try {
+        await caches.default.put(new Request('https://cache.internal/' + encodeURIComponent(key)), new Response(text, { headers: { 'Cache-Control': `public, max-age=${ttlSec}` } }));
+    }
+    catch { }
+}
+// ---------------------------------------------------------------------------
 // YouTube canlı yayın algılama (vitrinde canlı yayın göstermek için)
 // Ayarlar: Firestore `plus_ayarlar/canli` { kanal, sabitVideo } • Gizli anahtar: YOUTUBE_API_KEY (Worker secret)
 // Kota: 2 istek/kontrol (playlistItems + videos = 2 birim); sonuç 60 sn önbelleğe alınır, kullanıcı sayısından bağımsız.
@@ -283,13 +336,9 @@ async function checkYoutubeLive(env) {
 }
 async function handleLiveStatus(request, env, cors) {
     const headers = (ttl) => ({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': `public, max-age=${ttl}`, ...cors });
-    const cache = typeof caches !== 'undefined' ? caches.default : null;
-    const cacheKey = new Request('https://live-status.internal/v1');
-    if (cache) {
-        const hit = await cache.match(cacheKey);
-        if (hit)
-            return new Response(await hit.text(), { status: 200, headers: headers(30) });
-    }
+    const hit = await cacheGetText('live-status');
+    if (hit)
+        return new Response(hit, { status: 200, headers: headers(30) });
     let out;
     let ttl = 60;
     try {
@@ -302,8 +351,7 @@ async function handleLiveStatus(request, env, cors) {
     }
     out.checkedAt = Date.now();
     const body = JSON.stringify(out);
-    if (cache)
-        await cache.put(cacheKey, new Response(body, { headers: { 'Content-Type': 'application/json', 'Cache-Control': `public, max-age=${ttl}` } }));
+    await cachePutText('live-status', body, ttl);
     return new Response(body, { status: 200, headers: headers(Math.min(ttl, 30)) });
 }
 // ---------------------------------------------------------------------------
@@ -407,6 +455,92 @@ async function handleStaff(request, env, cors, action) {
     catch (e) {
         console.error('[personel]', e?.message || e);
         return json({ success: false, error: 'İşlem yapılamadı, lütfen tekrar deneyin.' }, 500);
+    }
+}
+// ---------------------------------------------------------------------------
+// Haber okunma sayacı (herkese açık: Instagram vb. bağlantılarla gelen misafirler de sayılır).
+// Sayaçlar ayrı koleksiyonda (plus_okunma/{haberId}) tutulur: haber belgesi her okumada değişmez,
+// yönetici düzenlemesi sayacı ezemez, bağlı kullanıcılara canlı güncelleme yağmuru gitmez.
+// Aynı kişi (IP) aynı haberi 6 saat içinde bir kez sayar; olmayan habere sayaç açılmaz.
+// ---------------------------------------------------------------------------
+const viewRate = new Map();
+const NEWS_ID_RE = /^[A-Za-z0-9_-]{1,120}$/;
+async function handleNewsView(request, env, cors) {
+    const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...cors } });
+    const body = await request.json().catch(() => null);
+    const id = typeof body?.id === 'string' ? body.id : '';
+    if (!NEWS_ID_RE.test(id))
+        return json({ success: false, error: 'Geçersiz haber.' }, 400);
+    const ip = request.headers.get('CF-Connecting-IP') || 'bilinmiyor';
+    const seenKey = `seen/${ip}/${id}`;
+    if ((await cacheGetText(seenKey)) !== undefined)
+        return json({ success: true, counted: false });
+    const now = Date.now();
+    const r = viewRate.get(ip);
+    if (!r || r.reset < now)
+        viewRate.set(ip, { n: 1, reset: now + 3600_000 });
+    else if (++r.n > 80)
+        return json({ success: true, counted: false });
+    try {
+        // Haber gerçekten var mı? (olumlu sonuç 10 dk önbellekte)
+        const existsKey = `exists/${id}`;
+        if ((await cacheGetText(existsKey)) === undefined) {
+            const news = await fsGetService(env, `plus_haberler/${id}`);
+            if (!news)
+                return json({ success: false, error: 'Haber bulunamadı.' }, 404);
+            await cachePutText(existsKey, '1', 600);
+        }
+        const w = await fsCommit(env, [
+            { transform: { document: `${FS_ROOT}/plus_okunma/${id}`, fieldTransforms: [{ fieldPath: 'views', increment: { integerValue: '1' } }] } },
+        ]);
+        if (!w.ok)
+            throw new Error('Firestore yazma hatası ' + w.status + ' ' + (w.error || ''));
+        const views = Number(w.writeResults?.[0]?.transformResults?.[0]?.integerValue) || undefined;
+        await cachePutText(seenKey, '1', 21600);
+        return json({ success: true, counted: true, views });
+    }
+    catch (e) {
+        console.error('[okunma]', e?.message || e);
+        return json({ success: false, error: 'Sayılamadı.' }, 500);
+    }
+}
+async function handleNewsViews(request, env, cors) {
+    const url = new URL(request.url);
+    const ids = [...new Set((url.searchParams.get('ids') || '').split(',').map((x) => x.trim()).filter((x) => NEWS_ID_RE.test(x)))].slice(0, 30).sort();
+    const headers = (ttl) => ({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': `public, max-age=${ttl}`, ...cors });
+    if (!ids.length)
+        return new Response(JSON.stringify({ views: {} }), { headers: headers(60) });
+    const cacheKey = `views/${ids.join(',')}`;
+    const hit = await cacheGetText(cacheKey);
+    if (hit !== undefined)
+        return new Response(hit, { headers: headers(60) });
+    try {
+        const access = await getServiceAccountToken(env);
+        const res = await fetch(`${FS_BASE}:batchGet`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ documents: ids.map((id) => `${FS_ROOT}/plus_okunma/${id}`) }),
+        });
+        if (!res.ok)
+            throw new Error('Firestore okuma hatası ' + res.status);
+        const rows = await res.json();
+        const views = {};
+        for (const row of rows) {
+            const name = row?.found?.name;
+            if (!name)
+                continue;
+            const n = Number(row.found.fields?.views?.integerValue);
+            if (n > 0)
+                views[name.split('/').pop()] = n;
+        }
+        const body = JSON.stringify({ views });
+        // Okuma kotasını korumak için 2 dk önbellek (kullanıcı sayısından bağımsız)
+        await cachePutText(cacheKey, body, 120);
+        return new Response(body, { headers: headers(60) });
+    }
+    catch (e) {
+        console.error('[okunma-liste]', e?.message || e);
+        return new Response(JSON.stringify({ views: {} }), { headers: headers(15) });
     }
 }
 const voteCounters = new Map();
@@ -802,11 +936,16 @@ async function fsCommit(env, writes) {
         body: JSON.stringify({ writes }),
     });
     let error = '';
+    let writeResults;
     if (!res.ok) {
         const out = await res.json().catch(() => ({}));
         error = String(out?.error?.status || out?.error?.message || '');
     }
-    return { ok: res.ok, status: res.status, error };
+    else {
+        // Artırma (increment) dönüşümlerinin yeni değerleri buradan okunur; ek okuma gerekmez
+        writeResults = (await res.json().catch(() => null))?.writeResults;
+    }
+    return { ok: res.ok, status: res.status, error, writeResults };
 }
 // Belge zaten varsa (exists:false koşulu) Firestore 409 / ALREADY_EXISTS / FAILED_PRECONDITION döner
 const fsIsDuplicate = (w) => w.status === 409 || w.error === 'ALREADY_EXISTS' || w.error === 'FAILED_PRECONDITION';
@@ -2735,6 +2874,12 @@ export default {
             const action = url.pathname.slice('/api/staff/'.length);
             return handleStaff(request, env, cors, action);
         }
+        if (url.pathname === '/api/news/view' && request.method === 'POST') {
+            return handleNewsView(request, env, cors);
+        }
+        if (url.pathname === '/api/news/views' && request.method === 'GET') {
+            return handleNewsViews(request, env, cors);
+        }
         if (url.pathname === '/api/live' && request.method === 'GET') {
             return handleLiveStatus(request, env, cors);
         }
@@ -2748,7 +2893,7 @@ export default {
             return handleUploadSignature(request, env, cors);
         }
         if (url.pathname === '/api/version') {
-            return new Response(JSON.stringify({ ok: true, build: '2026-11-08-editor', features: ['relatedId', 'kesinti-subTab', 'video-upload', 'haber-ihbar', 'account-delete', 'anket', 'canli-yayin', 'editor-atama'] }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...cors } });
+            return new Response(JSON.stringify({ ok: true, build: '2026-11-09-okunma', features: ['relatedId', 'kesinti-subTab', 'video-upload', 'haber-ihbar', 'account-delete', 'anket', 'canli-yayin', 'editor-atama', 'okunma'] }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...cors } });
         }
         if (url.pathname === '/test') {
             return new Response(TEST_PAGE, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
