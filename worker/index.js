@@ -355,7 +355,7 @@ async function handleLiveStatus(request, env, cors) {
     return new Response(body, { status: 200, headers: headers(Math.min(ttl, 30)) });
 }
 // ---------------------------------------------------------------------------
-// Editör atama / geri alma / listeleme (yalnızca yönetici).
+// Editör ve muhtar atama / geri alma / listeleme (yalnızca yönetici).
 // Yetki Firestore'daki `admins/{uid}` kaydından gelir; bu kayda istemci yazamaz, yalnızca bu uç noktalar yazar.
 // ---------------------------------------------------------------------------
 const staffCounters = new Map();
@@ -382,7 +382,7 @@ async function handleStaff(request, env, cors, action) {
         if (action === 'list') {
             const rows = await fsRunQuery(env, {
                 from: [{ collectionId: 'admins' }],
-                where: { fieldFilter: { field: { fieldPath: 'role' }, op: 'EQUAL', value: { stringValue: 'editor' } } },
+                where: { fieldFilter: { field: { fieldPath: 'role' }, op: 'IN', value: { arrayValue: { values: [{ stringValue: 'editor' }, { stringValue: 'muhtar' }] } } } },
                 limit: 200,
             });
             const editors = rows
@@ -394,6 +394,7 @@ async function handleStaff(request, env, cors, action) {
                 duties: Array.isArray(r.duties) ? r.duties.map(String) : [],
                 assignedAtMs: Number(r.assignedAtMs) || 0,
                 assignedByName: String(r.assignedByName || ''),
+                role: r.role === 'muhtar' ? 'muhtar' : 'editor',
             }))
                 .sort((a, b) => b.assignedAtMs - a.assignedAtMs);
             return json({ success: true, editors });
@@ -417,12 +418,14 @@ async function handleStaff(request, env, cors, action) {
             const profile = await fsGetService(env, `plus_users/${targetUid}`);
             if (!profile)
                 return json({ success: false, error: 'Bu kişinin uygulamada profili yok. Önce uygulamaya girip kayıt olmalı.' }, 404);
+            // Yalnızca editör <-> muhtar arasında geçiş yapılabilir; yönetici kayıtlarına dokunulmaz
+            const newRole = body.role === 'muhtar' ? 'muhtar' : 'editor';
             const existing = await fsGetService(env, `admins/${targetUid}`);
-            if (existing && existing.role !== 'editor')
-                return json({ success: false, error: 'Bu kişi zaten yönetici veya muhtar; rolü değiştirilemez.' }, 409);
+            if (existing && existing.role !== 'editor' && existing.role !== 'muhtar')
+                return json({ success: false, error: 'Bu kişi zaten yönetici; rolü değiştirilemez.' }, 409);
             const duties = Array.isArray(body.duties) ? body.duties.filter((d) => typeof d === 'string').slice(0, 8).map((d) => d.slice(0, 60)) : [];
             const record = {
-                role: 'editor',
+                role: newRole,
                 name: String(body.name || profile.name || '').trim().slice(0, 80),
                 email,
                 phone: String(body.phone || profile.phone || '').trim().slice(0, 30),
@@ -443,8 +446,8 @@ async function handleStaff(request, env, cors, action) {
             if (uid === user.uid)
                 return json({ success: false, error: 'Kendi yetkinizi buradan kaldıramazsınız.' }, 400);
             const target = await fsGetService(env, `admins/${uid}`);
-            if (!target || target.role !== 'editor')
-                return json({ success: false, error: 'Yalnızca editör yetkisi geri alınabilir.' }, 403);
+            if (!target || (target.role !== 'editor' && target.role !== 'muhtar'))
+                return json({ success: false, error: 'Yalnızca editör veya muhtar yetkisi geri alınabilir.' }, 403);
             const w = await fsCommit(env, [{ delete: `${FS_ROOT}/admins/${uid}` }]);
             if (!w.ok)
                 throw new Error('Firestore silme hatası ' + w.status);
