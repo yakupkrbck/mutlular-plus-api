@@ -1024,24 +1024,84 @@ function trDateLabel(ms) {
     const p = (n) => String(n).padStart(2, '0');
     return `${p(d.getUTCDate())}.${p(d.getUTCMonth() + 1)} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
 }
+// Cihaz kapalı / internetsiz iken bildirimin FCM'de bekleme süresi (sn). Süre dolunca düşer; kayıt Bildirim Merkezi'nde kalır.
+const PUSH_TTL = {
+    son_dakika: 21600, // 6 saat
+    canli_yayin: 3600, // 1 saat (yayın bitince anlamsız)
+    haber: 86400, // 24 saat
+    kesinti: 43200, // 12 saat
+    vefat: 259200, // 3 gün
+    teklif: 259200,
+    ilan: 259200,
+    sistem: 259200,
+    muhtarlik: 259200,
+    duyuru: 259200,
+    ozel: 259200,
+};
+const ttlFor = (t) => PUSH_TTL[t] || 86400;
 async function sendTopic(env, d) {
-    const access = await getServiceAccountToken(env);
-    const res = await fetch(`https://fcm.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/messages:send`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            message: {
-                topic: d.topic,
-                notification: { title: d.title.slice(0, 100), body: d.body.slice(0, 300) },
-                data: { type: d.notifType, actionTab: d.actionTab || 'profil', subTab: d.subTab || 'bildirimler', ...(d.relatedId ? { relatedId: String(d.relatedId).slice(0, 120) } : {}) },
-                webpush: { headers: { Urgency: 'high', TTL: '86400' } },
-                android: { priority: 'HIGH', ttl: '86400s' },
-            },
-        }),
-    });
-    if (!res.ok) {
-        const out = await res.json().catch(() => ({}));
-        throw new Error('FCM: ' + (out?.error?.message || res.status));
+    const ttl = Math.max(60, Math.min(2419200, d.ttlSec || ttlFor(d.notifType)));
+    const message = {
+        topic: d.topic,
+        notification: { title: d.title.slice(0, 100), body: d.body.slice(0, 300) },
+        data: {
+            type: d.notifType,
+            actionTab: d.actionTab || 'profil',
+            subTab: d.subTab || 'bildirimler',
+            ...(d.relatedId ? { relatedId: String(d.relatedId).slice(0, 120) } : {}),
+            ...(d.nid ? { nid: String(d.nid).slice(0, 80) } : {}),
+        },
+        webpush: { headers: { Urgency: 'high', TTL: String(ttl) } },
+        android: { priority: 'HIGH', ttl: `${ttl}s` },
+    };
+    // Geçici hatalarda (ağ, 429, 5xx) 3 kez dener; kalıcı hatada (4xx) hemen bırakır
+    let lastErr = '';
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            const access = await getServiceAccountToken(env);
+            const res = await fetch(`https://fcm.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/messages:send`, {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message }),
+            });
+            if (res.ok) {
+                const out = await res.json().catch(() => ({}));
+                return { attempts: attempt, messageName: String(out?.name || '') };
+            }
+            const out = await res.json().catch(() => ({}));
+            lastErr = String(out?.error?.message || res.status);
+            if (res.status !== 429 && res.status < 500)
+                break;
+        }
+        catch (e) {
+            lastErr = String((e && e.message) || e);
+        }
+        if (attempt < 3)
+            await new Promise((r) => setTimeout(r, attempt * 600));
+    }
+    throw new Error('FCM: ' + lastErr);
+}
+// Cihaz kaydı: "kaç cihaza/kullanıcıya gitti" raporu için (jetonun kendisi saklanmaz, yalnız özeti)
+async function recordDevice(env, uid, token) {
+    try {
+        const id = await sha1Short(token);
+        await fsCommit(env, [{ update: { name: `${FS_ROOT}/plus_push_cihazlar/${id}`, fields: fsFields({ uid, lastSeenMs: Date.now() }) } }]);
+    }
+    catch { /* rapor amaçlı; hata bildirimi engellemez */ }
+}
+async function pushTargets(env) {
+    const cutoff = Date.now() - 45 * 86400000;
+    try {
+        const rows = await fsRunQuery(env, {
+            from: [{ collectionId: 'plus_push_cihazlar' }],
+            where: { fieldFilter: { field: { fieldPath: 'lastSeenMs' }, op: 'GREATER_THAN_OR_EQUAL', value: { integerValue: String(cutoff) } } },
+            select: { fields: [{ fieldPath: 'uid' }] },
+            limit: 5000,
+        });
+        return { cihaz: rows.length, kullanici: new Set(rows.map((r) => r.uid).filter(Boolean)).size };
+    }
+    catch {
+        return { cihaz: 0, kullanici: 0 };
     }
 }
 async function deliver(env, d) {
@@ -1307,19 +1367,7 @@ const EVENTS = {
         return {
             dedupKey: `vefat-bekliyor:${d.__id}`,
             deliveries: async () => [
-                { topic: 'staff', title: '🕊️ Vefat ilanı onay bekliyor', body: clip(d.name, 80), notifType: 'vefat', actionTab: 'profil', uids: await adminUids(c.env) },
-            ],
-        };
-    },
-    // Vefat ilanı: onay bekliyor → yönetime
-    'vefat-bekliyor': async (c) => {
-        const d = await c.get(`plus_vefat/${clip(c.body.id, 80)}`);
-        if (!d || d.ownerUid !== c.uid || d.status !== 'pending')
-            return null;
-        return {
-            dedupKey: `vefat-bekliyor:${d.__id}`,
-            deliveries: async () => [
-                { topic: 'staff', title: '🕊️ Cenaze ilanı onay bekliyor', body: clip(d.name, 100), notifType: 'vefat', actionTab: 'onay_bekleyen', uids: await adminUids(c.env) },
+                { topic: 'staff', title: '🕊️ Cenaze ilanı onay bekliyor', body: clip(d.name, 80), notifType: 'vefat', actionTab: 'onay_bekleyen', uids: await adminUids(c.env) },
             ],
         };
     },
@@ -1479,6 +1527,7 @@ async function handlePush(request, env, cors, path) {
             }
             if (errors.length === topics.length)
                 return json({ success: false, error: 'Abonelik başarısız: ' + errors[0] }, 502);
+            await recordDevice(env, user.uid, token);
             return json({ success: true, topics: topics.length, failed: errors.length ? errors : undefined });
         }
         // ---- Çıkış: kişiye özel / yönetim / usta konularından çıkar ("tum" kalır)
@@ -1490,6 +1539,7 @@ async function handlePush(request, env, cors, path) {
             const { managed } = await desiredTopics(user.uid, idToken);
             for (const t of managed)
                 await iidBatch(access, 'batchRemove', t, token);
+            await recordDevice(env, '', token); // cihaz "tum" konusunda kalır; kullanıcıyla bağı kopar
             return json({ success: true });
         }
         // ---- Yönetim duyurusu: tüm cihazlara
@@ -1503,16 +1553,42 @@ async function handlePush(request, env, cors, path) {
             const text = String(body.body || '').trim().slice(0, 300);
             if (!title || !text)
                 return json({ success: false, error: 'Başlık ve mesaj gerekli.' }, 400);
-            await sendTopic(env, {
-                topic: 'tum',
-                title,
-                body: text,
-                notifType: 'duyuru',
-                actionTab: typeof body.actionTab === 'string' ? body.actionTab.slice(0, 30) : 'profil',
-                subTab: typeof body.subTab === 'string' ? body.subTab.slice(0, 30) : undefined,
-                relatedId: typeof body.relatedId === 'string' ? body.relatedId.slice(0, 120) : undefined,
-            });
-            return json({ success: true });
+            const TYPES = ['duyuru', 'haber', 'ilan', 'vefat', 'kesinti', 'sistem', 'ozel', 'son_dakika', 'canli_yayin', 'muhtarlik'];
+            const nType = TYPES.includes(body.notifType) ? body.notifType : 'duyuru';
+            const actionTab = typeof body.actionTab === 'string' ? body.actionTab.slice(0, 30) : 'profil';
+            const subTab = typeof body.subTab === 'string' ? body.subTab.slice(0, 30) : undefined;
+            const relatedId = typeof body.relatedId === 'string' ? body.relatedId.slice(0, 120) : undefined;
+            const badgeText = typeof body.badgeText === 'string' ? body.badgeText.slice(0, 20) : undefined;
+            const sender = typeof body.sender === 'string' && body.sender.trim() ? body.sender.trim().slice(0, 40) : 'Mutlular Plus';
+            // Çift tıklama / tekrar gönderimi önler: aynı dedupId ile başarıyla gönderilmiş bildirim bir daha gitmez
+            const dedupId = typeof body.dedupId === 'string' ? slugAlan(body.dedupId).slice(0, 60) : '';
+            const nid = dedupId ? `bn-${dedupId}` : `bn-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+            const statPath = `plus_bildirim_istatistik/${nid}`;
+            if (dedupId) {
+                const prev = await fsGetService(env, statPath);
+                if (prev && prev.durum === 'gonderildi')
+                    return json({ success: true, duplicate: true, id: nid, hedefCihaz: prev.hedefCihaz || 0, hedefKullanici: prev.hedefKullanici || 0 });
+            }
+            const hedef = await pushTargets(env);
+            const now = Date.now();
+            // 1) Önce uygulama içi kayıt + rapor belgesi (push kaybolsa bile kullanıcı Bildirim Merkezi'nde görür)
+            const wr = await fsCommit(env, [
+                { update: { name: `${FS_ROOT}/plus_duyurular/${nid}`, fields: fsFields({ id: nid, type: nType, title, message: text, date: trDateLabel(now), read: false, actionTab, subTab, relatedId, badgeText, sender, createdAtMs: now }) } },
+                { update: { name: `${FS_ROOT}/${statPath}`, fields: fsFields({ id: nid, title, message: text, type: nType, createdAtMs: now, gonderenUid: user.uid, hedefCihaz: hedef.cihaz, hedefKullanici: hedef.kullanici, durum: 'gonderiliyor', denemeSayisi: 0 }) } },
+            ]);
+            if (!wr.ok)
+                console.error('[push/send] kayıt yazılamadı', wr.status, wr.error);
+            // 2) Cihazlara gönder (3 denemeli)
+            try {
+                const sent = await sendTopic(env, { topic: 'tum', title, body: text, notifType: nType, actionTab, subTab, relatedId, nid, ttlSec: body.urgent ? 21600 : undefined });
+                await fsCommit(env, [{ update: { name: `${FS_ROOT}/${statPath}`, fields: fsFields({ durum: 'gonderildi', denemeSayisi: sent.attempts, gonderimMs: Date.now() }) }, updateMask: { fieldPaths: ['durum', 'denemeSayisi', 'gonderimMs'] } }]);
+            }
+            catch (e) {
+                const msg = String((e && e.message) || e).slice(0, 200);
+                await fsCommit(env, [{ update: { name: `${FS_ROOT}/${statPath}`, fields: fsFields({ durum: 'hata', hata: msg }) }, updateMask: { fieldPaths: ['durum', 'hata'] } }]);
+                return json({ success: false, error: 'Cihaz bildirimi gönderilemedi: ' + msg, id: nid }, 502);
+            }
+            return json({ success: true, id: nid, hedefCihaz: hedef.cihaz, hedefKullanici: hedef.kullanici });
         }
         // ---- Olay tabanlı bildirimler
         if (path === '/api/push/event') {
