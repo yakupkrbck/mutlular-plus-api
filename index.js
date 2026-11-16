@@ -1169,7 +1169,7 @@ const EVENTS = {
         return {
             dedupKey: `ilan-bekliyor:${d.__id}`,
             deliveries: async () => [
-                { topic: 'staff', title: '📋 İlan onay bekliyor', body: clip(d.title, 100), notifType: 'ilan', actionTab: 'profil', uids: await adminUids(c.env) },
+                { topic: 'staff', title: '📋 İlan onay bekliyor', body: clip(d.title, 100), notifType: 'ilan', actionTab: 'onay_bekleyen', uids: await adminUids(c.env) },
             ],
         };
     },
@@ -1202,7 +1202,7 @@ const EVENTS = {
         return {
             dedupKey: `esnaf-basvuru:${d.__id}`,
             deliveries: async () => [
-                { topic: 'staff', title: '🏪 Yeni esnaf başvurusu', body: `${clip(d.businessName, 80)} • ${clip(d.category, 40)} onay bekliyor.`, notifType: 'sistem', actionTab: 'profil', uids: await adminUids(c.env) },
+                { topic: 'staff', title: '🏪 Yeni esnaf başvurusu', body: `${clip(d.businessName, 80)} • ${clip(d.category, 40)} onay bekliyor.`, notifType: 'sistem', actionTab: 'onay_bekleyen', uids: await adminUids(c.env) },
             ],
         };
     },
@@ -1308,6 +1308,18 @@ const EVENTS = {
             dedupKey: `vefat-bekliyor:${d.__id}`,
             deliveries: async () => [
                 { topic: 'staff', title: '🕊️ Vefat ilanı onay bekliyor', body: clip(d.name, 80), notifType: 'vefat', actionTab: 'profil', uids: await adminUids(c.env) },
+            ],
+        };
+    },
+    // Vefat ilanı: onay bekliyor → yönetime
+    'vefat-bekliyor': async (c) => {
+        const d = await c.get(`plus_vefat/${clip(c.body.id, 80)}`);
+        if (!d || d.ownerUid !== c.uid || d.status !== 'pending')
+            return null;
+        return {
+            dedupKey: `vefat-bekliyor:${d.__id}`,
+            deliveries: async () => [
+                { topic: 'staff', title: '🕊️ Cenaze ilanı onay bekliyor', body: clip(d.name, 100), notifType: 'vefat', actionTab: 'onay_bekleyen', uids: await adminUids(c.env) },
             ],
         };
     },
