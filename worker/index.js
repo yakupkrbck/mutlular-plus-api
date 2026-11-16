@@ -617,6 +617,8 @@ const OWNED_COLLECTIONS = [
     ['plus_muhtarlik', 'ownerUid'],
     ['plus_haber_ihbar', 'ownerUid'],
     ['plus_anket_oylar', 'uid'],
+    ['plus_canli_yorumlar', 'uid'],
+    ['plus_sikayetler', 'reporterUid'],
 ];
 async function deleteDocs(env, names) {
     for (let i = 0; i < names.length; i += 400) {
@@ -684,19 +686,21 @@ async function handleAccountDelete(request, env, cors) {
         deleted.plus_hizmet_alanlari = fields.length;
         // 3) Kişisel bildirimler (alt koleksiyon) ve profil belgesi
         const access = await getServiceAccountToken(env);
-        let notif = 0;
-        for (let pass = 0; pass < 10; pass++) {
-            const res = await fetch(`${FS_BASE}/plus_users/${encodeURIComponent(uid)}/bildirimler?pageSize=300`, { headers: { Authorization: `Bearer ${access}` } });
-            if (!res.ok)
-                break;
-            const data = await res.json();
-            const names = (data.documents || []).map((d) => d.name);
-            if (!names.length)
-                break;
-            await deleteDocs(env, names);
-            notif += names.length;
+        for (const sub of ['bildirimler', 'engellenenler']) {
+            let count = 0;
+            for (let pass = 0; pass < 10; pass++) {
+                const res = await fetch(`${FS_BASE}/plus_users/${encodeURIComponent(uid)}/${sub}?pageSize=300`, { headers: { Authorization: `Bearer ${access}` } });
+                if (!res.ok)
+                    break;
+                const data = await res.json();
+                const names = (data.documents || []).map((d) => d.name);
+                if (!names.length)
+                    break;
+                await deleteDocs(env, names);
+                count += names.length;
+            }
+            deleted[sub] = count;
         }
-        deleted.bildirimler = notif;
         await deleteDocs(env, [`${FS_ROOT}/plus_users/${uid}`]);
         // 4) Firebase Authentication hesabı
         const del = await fetch(`https://identitytoolkit.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/accounts:delete`, {
